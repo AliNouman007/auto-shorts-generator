@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+data/
+uploads/*.mp4
+uploads/*.mp3
+outputs/*.mp4
+outputs/*.srt
+.env

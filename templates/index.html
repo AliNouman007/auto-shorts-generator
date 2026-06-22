@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Auto Shorts Generator</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+<header class="header">
+  <div class="header-inner">
+    <a href="/" class="logo">
+      <div class="logo-icon">✂</div>
+      Auto Shorts Generator
+    </a>
+    <div class="header-status">
+      {% if has_youtube_key %}
+        <span class="pill ok"><span class="dot"></span>YouTube API</span>
+      {% else %}
+        <span class="pill warn"><span class="dot"></span>YouTube API missing</span>
+      {% endif %}
+      {% if ai_model == 'gemini' %}
+        {% if has_gemini_key %}
+          <span class="pill ok"><span class="dot"></span>Gemini</span>
+        {% else %}
+          <span class="pill error"><span class="dot"></span>Gemini key missing</span>
+        {% endif %}
+      {% else %}
+        {% if has_openai_key %}
+          <span class="pill ok"><span class="dot"></span>OpenAI</span>
+        {% else %}
+          <span class="pill warn"><span class="dot"></span>OpenAI optional</span>
+        {% endif %}
+      {% endif %}
+    </div>
+  </div>
+</header>
+
+<main class="main">
+
+  <!-- ===================== SETTINGS PANEL ===================== -->
+  <div class="settings-card" id="settings-panel">
+    <div class="settings-header" onclick="toggleSettings()">
+      <div style="display:flex;align-items:center;gap:0.6rem">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M4.93 4.93a10 10 0 0 0 0 14.14"/></svg>
+        <span class="settings-title">Settings</span>
+        <span class="channel-id-badge" id="header-channel-id">{{ channel_id }}</span>
+      </div>
+      <svg id="settings-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="transition:transform 0.2s"><polyline points="6 9 12 15 18 9"/></svg>
+    </div>
+
+    <div class="settings-body" id="settings-body" style="display:none">
+      <div class="settings-grid">
+        <div class="settings-field">
+          <label class="field-label">YouTube Channel ID or Handle</label>
+          <div style="display:flex;gap:0.5rem">
+            <input type="text" id="input-channel-id" class="field-input"
+              placeholder="@YourChannel or UCxxxxxx" value="{{ channel_id if channel_id != 'Not configured' else '' }}" />
+            <button class="btn btn-primary btn-sm" onclick="saveSettings()">Save</button>
+          </div>
+          <div class="field-hint">Use your @handle (e.g. @MrBeast) or a UC… channel ID.</div>
+        </div>
+
+        <div class="settings-field">
+          <label class="field-label">AI Transcription Model</label>
+          <div class="model-toggle">
+            <button class="model-btn {% if ai_model == 'openai' %}active{% endif %}" id="btn-openai" onclick="setModel('openai')">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M22.282 9.821a5.985 5.985 0 0 0-.516-4.91 6.046 6.046 0 0 0-6.51-2.9A6.065 6.065 0 0 0 4.981 4.18a5.985 5.985 0 0 0-3.998 2.9 6.046 6.046 0 0 0 .743 7.097 5.98 5.98 0 0 0 .51 4.911 6.051 6.051 0 0 0 6.515 2.9A5.985 5.985 0 0 0 13.26 24a6.056 6.056 0 0 0 5.772-4.206 5.99 5.99 0 0 0 3.997-2.9 6.056 6.056 0 0 0-.747-7.073z"/></svg>
+              OpenAI Whisper
+            </button>
+            <button class="model-btn {% if ai_model == 'gemini' %}active{% endif %}" id="btn-gemini" onclick="setModel('gemini')">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+              Gemini Flash
+            </button>
+          </div>
+          <div class="field-hint">
+            OpenAI uses Whisper API. Gemini uses your GEMINI_API_KEY. Local Whisper CLI tried first (free).
+          </div>
+        </div>
+      </div>
+
+      <div id="channel-preview" style="margin-top:1rem;display:none">
+        <div class="channel-preview-card">
+          <img id="ch-thumb" src="" alt="" style="width:40px;height:40px;border-radius:50%;object-fit:cover;flex-shrink:0" />
+          <div>
+            <div id="ch-name" style="font-weight:600;font-size:0.875rem"></div>
+            <div id="ch-stats" style="font-size:0.75rem;color:var(--text-muted)"></div>
+          </div>
+        </div>
+      </div>
+
+      <div style="margin-top:1rem;display:flex;gap:0.5rem;flex-wrap:wrap">
+        <button class="btn btn-secondary btn-sm" onclick="loadChannelPreview()">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Preview Channel
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================== CONTROL BAR ===================== -->
+  <div class="control-bar">
+    <button class="btn btn-primary" id="btn-check-youtube" onclick="checkYoutube()">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22.54 6.42a2.78 2.78 0 0 0-1.95-1.95C18.88 4 12 4 12 4s-6.88 0-8.59.47A2.78 2.78 0 0 0 1.46 6.42 29 29 0 0 0 1 12a29 29 0 0 0 .46 5.58 2.78 2.78 0 0 0 1.95 1.95C5.12 20 12 20 12 20s6.88 0 8.59-.47a2.78 2.78 0 0 0 1.95-1.95A29 29 0 0 0 23 12a29 29 0 0 0-.46-5.58z"/><polygon points="9.75 15.02 15.5 12 9.75 8.98 9.75 15.02"/></svg>
+      Check YouTube Uploads
+    </button>
+    <button class="btn btn-secondary" onclick="location.reload()">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+      Refresh
+    </button>
+  </div>
+
+  <!-- ===================== VIDEOS ===================== -->
+  <p class="section-title">Your Videos ({{ videos|length }})</p>
+
+  {% if not videos %}
+  <div class="empty-state">
+    <div class="empty-state-icon">📺</div>
+    <h3>No videos detected yet</h3>
+    <p>Click "Check YouTube Uploads" to scan your channel, or configure your channel ID in Settings above.</p>
+  </div>
+  {% endif %}
+
+  <div class="video-list" id="video-list">
+    {% for video in videos %}
+    <div class="video-card" id="card-{{ video.id }}">
+
+      <div class="video-card-header">
+        {% if video.thumbnail %}
+        <img class="video-thumb" src="{{ video.thumbnail }}" alt="" />
+        {% endif %}
+
+        <div class="video-meta">
+          <div class="video-title">{{ video.title or 'Untitled' }}</div>
+          <div class="video-sub">
+            <a class="yt-link" href="https://youtube.com/watch?v={{ video.youtube_video_id }}" target="_blank" rel="noopener">
+              {{ video.youtube_video_id }}
+            </a>
+            {% if video.published_at %}<span>·</span><span>{{ video.published_at[:10] }}</span>{% endif %}
+          </div>
+        </div>
+
+        <div class="video-actions">
+          <span class="status-badge status-{{ video.status }}" id="status-{{ video.id }}">
+            {% if video.status in ('processing', 'downloading') %}<span class="spin" style="border-top-color:var(--accent)"></span>{% endif %}
+            {{ video.status }}
+          </span>
+
+          {% if video.status in ('detected', 'waiting', 'failed') %}
+          <button class="btn btn-primary btn-sm" id="dl-btn-{{ video.id }}" onclick="downloadAndProcess({{ video.id }}, this)">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22.54 6.42a2.78 2.78 0 0 0-1.95-1.95C18.88 4 12 4 12 4s-6.88 0-8.59.47A2.78 2.78 0 0 0 1.46 6.42 29 29 0 0 0 1 12a29 29 0 0 0 .46 5.58 2.78 2.78 0 0 0 1.95 1.95C5.12 20 12 20 12 20s6.88 0 8.59-.47a2.78 2.78 0 0 0 1.95-1.95A29 29 0 0 0 23 12a29 29 0 0 0-.46-5.58z"/><polygon points="9.75 15.02 15.5 12 9.75 8.98 9.75 15.02"/></svg>
+            Download &amp; Generate
+          </button>
+          <button class="btn btn-secondary btn-sm" onclick="openUpload({{ video.id }})">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+            Upload File
+          </button>
+          {% endif %}
+
+          {% if video.status == 'waiting' %}
+          <button class="btn btn-primary btn-sm" onclick="processVideo({{ video.id }}, this)">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+            Generate Shorts
+          </button>
+          {% endif %}
+
+          {% if video.status == 'failed' and video.source_path %}
+          <button class="btn btn-ghost btn-sm" onclick="processVideo({{ video.id }}, this)">Retry</button>
+          {% endif %}
+        </div>
+      </div>
+
+      {% if video.error_message %}
+      <div class="error-box">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0;margin-top:1px"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+        {{ video.error_message }}
+      </div>
+      {% endif %}
+
+      <!-- Steps progress (shown live during processing/downloading) -->
+      <div class="steps-panel" id="steps-{{ video.id }}" style="display:{% if video.status in ('processing','downloading') %}block{% else %}none{% endif %}">
+        <div class="steps-list" id="steps-list-{{ video.id }}">
+          {% if video.steps_json %}
+            {% set steps = video.steps_json | tojson | safe %}
+          {% endif %}
+        </div>
+      </div>
+
+      <!-- Upload zone -->
+      <div class="upload-zone" id="upload-zone-{{ video.id }}" style="display:none">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0;color:var(--text-muted)"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+        <label>Local video file:</label>
+        <input type="file" id="file-{{ video.id }}" accept="video/*" />
+        <button class="btn btn-primary btn-sm" onclick="uploadSource({{ video.id }})">Upload</button>
+        <button class="btn btn-secondary btn-sm" onclick="closeUpload({{ video.id }})">Cancel</button>
+      </div>
+
+      {% if video.shorts %}
+      <div class="shorts-section">
+        <div class="shorts-label">{{ video.shorts|length }} Short{{ 's' if video.shorts|length != 1 }} Generated</div>
+        <div class="shorts-grid">
+          {% for short in video.shorts %}
+          <div class="short-card">
+            <div class="short-name">{{ short.filename }}</div>
+            <div class="short-meta">
+              {% if short.duration %}{{ '%.1f'|format(short.duration) }}s{% endif %}
+              {% if short.start_time is not none %} · {{ '%.0f'|format(short.start_time) }}s–{{ '%.0f'|format(short.end_time) }}s{% endif %}
+            </div>
+            <a href="/download/{{ short.filename }}" class="btn btn-ghost btn-sm" style="text-decoration:none;margin-top:0.25rem" download>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+              Download
+            </a>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+      {% endif %}
+
+    </div>
+    {% endfor %}
+  </div>
+
+</main>
+
+<div id="toast-area"></div>
+<script src="/static/app.js?v=3"></script>
+</body>
+</html>
