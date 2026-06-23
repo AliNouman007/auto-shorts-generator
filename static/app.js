@@ -1,4 +1,4 @@
-/* Auto Shorts Generator — Frontend JS */
+/* Auto Shorts Studio — Frontend JS v7 */
 
 // ---------------------------------------------------------------------------
 // Toast
@@ -339,9 +339,17 @@ function escJsString(s) {
   return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 }
 
+function shortStatusPill(status) {
+  const s = status || 'draft';
+  return `<span class="short-status-pill short-status-${s}" id="short-status-${s}">${s}</span>`;
+}
+
 function renderShortCard(short) {
   const filename = escHtml(short.filename || '');
-  const title = short.title ? `<div class="short-title">${escHtml(short.title)}</div>` : '';
+  const status = short.status || 'draft';
+  const title = short.title
+    ? `<div class="short-card-top"><div class="short-title">${escHtml(short.title)}</div><span class="short-status-pill short-status-${status}" id="short-status-${short.id}">${status}</span></div>`
+    : `<div class="short-card-top"><span class="short-status-pill short-status-${status}" id="short-status-${short.id}">${status}</span></div>`;
   const duration = short.duration ? `${Number(short.duration).toFixed(1)}s` : '';
   const range = short.start_time !== null && short.start_time !== undefined
     ? ` · ${Math.round(Number(short.start_time))}s–${Math.round(Number(short.end_time || 0))}s`
@@ -358,16 +366,22 @@ function renderShortCard(short) {
     : '';
   const reason = short.selection_reason ? `<div class="short-reason">${escHtml(short.selection_reason)}</div>` : '';
 
-  return `<div class="short-card" data-short-id="${short.id}">
+  return `<div class="short-card" data-short-id="${short.id}" data-short-status="${status}">
     ${title}
     <div class="short-name">${filename}</div>
     <div class="short-meta">${duration}${range}</div>
     ${scores}
     ${reason}
-    <div style="display:flex;gap:0.4rem;flex-wrap:wrap;margin-top:0.25rem">
-      <button class="btn btn-primary btn-sm" onclick="openShortPlayer('${escJsString(short.filename || '')}')">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 3 20 12 6 21 6 3"/></svg>
-        Play
+    <div class="short-actions">
+      <a href="/review/${short.id}" class="btn btn-primary btn-sm" style="text-decoration:none">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+        Review
+      </a>
+      <button class="btn btn-sm short-approve-btn" onclick="quickApprove(${short.id}, this)" title="Approve">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+      </button>
+      <button class="btn btn-sm short-reject-btn" onclick="quickReject(${short.id}, this)" title="Reject">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
       </button>
       <a href="/download/${encodeURIComponent(short.filename || '')}" class="btn btn-ghost btn-sm" style="text-decoration:none" download>
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
@@ -376,6 +390,44 @@ function renderShortCard(short) {
       <button class="btn btn-danger btn-sm" onclick="deleteShort(${short.id}, this)">Delete</button>
     </div>
   </div>`;
+}
+
+// ---------------------------------------------------------------------------
+// Quick approve / reject from dashboard cards
+// ---------------------------------------------------------------------------
+
+async function quickApprove(shortId, btn) {
+  btn.disabled = true;
+  try {
+    const res = await fetch(`/shorts/${shortId}/approve`, { method: 'POST' });
+    if (!res.ok) { showToast('Failed to approve', 'error'); return; }
+    const pill = document.getElementById(`short-status-${shortId}`);
+    if (pill) { pill.className = 'short-status-pill short-status-approved'; pill.textContent = 'approved'; }
+    const card = btn.closest('.short-card');
+    if (card) card.dataset.shortStatus = 'approved';
+    showToast('Approved ✓', 'success');
+  } catch(e) {
+    showToast('Network error', 'error');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function quickReject(shortId, btn) {
+  btn.disabled = true;
+  try {
+    const res = await fetch(`/shorts/${shortId}/reject`, { method: 'POST' });
+    if (!res.ok) { showToast('Failed to reject', 'error'); return; }
+    const pill = document.getElementById(`short-status-${shortId}`);
+    if (pill) { pill.className = 'short-status-pill short-status-rejected'; pill.textContent = 'rejected'; }
+    const card = btn.closest('.short-card');
+    if (card) card.dataset.shortStatus = 'rejected';
+    showToast('Rejected', 'info');
+  } catch(e) {
+    showToast('Network error', 'error');
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 function renderGeneratedShorts(videoId, shorts) {
@@ -513,3 +565,4 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 });
+
