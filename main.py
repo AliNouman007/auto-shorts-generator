@@ -25,7 +25,7 @@ from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from services import exporting, presets, youtube_upload
+from services import exporting, presets, shorts_director, youtube_upload
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -105,6 +105,42 @@ def missing_tools_message(commands: tuple[str, ...]) -> str:
     if not missing:
         return ""
     return f"Missing required command(s): {', '.join(missing)}. Install them and restart the app."
+
+
+def ytdlp_js_runtime_arg() -> str:
+    """Return a yt-dlp --js-runtimes value for an installed runtime."""
+    node_path = shutil.which("node")
+    if node_path:
+        return f"node:{node_path}"
+    deno_path = shutil.which("deno")
+    if deno_path:
+        return f"deno:{deno_path}"
+    return ""
+
+
+def missing_ytdlp_runtime_message() -> str:
+    if ytdlp_js_runtime_arg():
+        return ""
+    return (
+        "Missing JavaScript runtime for yt-dlp. Install Node.js or Deno, then restart the app. "
+        "YouTube extraction can fail with HTTP 403 without a JS runtime."
+    )
+
+
+def build_ytdlp_download_command(yt_id: str, output_path: str) -> list[str]:
+    cmd = [
+        "yt-dlp",
+        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+        "--merge-output-format", "mp4",
+        "-o", output_path,
+        "--no-playlist",
+        "--newline",
+    ]
+    runtime = ytdlp_js_runtime_arg()
+    if runtime:
+        cmd.extend(["--js-runtimes", runtime])
+    cmd.append(f"https://www.youtube.com/watch?v={yt_id}")
+    return cmd
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -1417,39 +1453,18 @@ def build_scene_candidates(
     hard_max_duration: float = 300,
     limit: int = 24,
 ) -> list[dict]:
-    groups = _sentence_groups(segments)
-    candidates = []
-    for start_idx in range(len(groups)):
-        text_parts = []
-        start = float(groups[start_idx]["start"])
-        for end_idx in range(start_idx, len(groups)):
-            end = float(groups[end_idx]["end"])
-            duration = end - start
-            if duration > hard_max_duration:
-                break
-            text_parts.append(groups[end_idx]["text"])
-            if duration < min_duration:
-                continue
-            text = " ".join(text_parts).strip()
-            if len(_words(text)) < 25:
-                continue
-            virality, completion, hook_type = _candidate_scores(text, duration)
-            if duration > preferred_max_duration:
-                virality -= min(20,
-                                int((duration - preferred_max_duration) / 12))
-            pre_score = _clamp_score((virality * 0.65) + (completion * 0.35))
-            candidates.append({
-                "start": start,
-                "end": end,
-                "duration": duration,
-                "text": text,
-                "pre_score": pre_score,
-                "virality_score": virality,
-                "completion_score": completion,
-                "hook_type": hook_type,
-            })
-    candidates.sort(key=lambda item: item["pre_score"], reverse=True)
-    return _dedupe_clips(candidates, limit=limit, overlap_threshold=0.65)
+    duration = max((float(seg.get("end", 0)) for seg in segments), default=0)
+    return shorts_director.build_director_candidates(
+        segments,
+        duration=duration,
+        preset={
+            "min_clip_duration": min_duration,
+            "preferred_max_clip_duration": preferred_max_duration,
+            "hard_max_clip_duration": hard_max_duration,
+            "allow_three_minute_shorts": hard_max_duration > 180,
+        },
+        limit=limit,
+    )
 
 
 def _overlap_ratio(a: dict, b: dict) -> float:
@@ -1475,23 +1490,7 @@ def _dedupe_clips(clips: list[dict], limit: int, overlap_threshold: float = 0.5)
 
 
 def rank_candidates_fallback(candidates: list[dict], target_count: int = 5) -> list[dict]:
-    ranked = []
-    for idx, candidate in enumerate(candidates, start=1):
-        virality = int(candidate.get("virality_score")
-                       or candidate.get("pre_score") or 60)
-        completion = int(candidate.get("completion_score") or 70)
-        hook_type = candidate.get("hook_type") or "story"
-        ranked.append({
-            **candidate,
-            "title": candidate.get("title") or f"Highlight {idx}",
-            "virality_score": _clamp_score(virality),
-            "completion_score": _clamp_score(completion),
-            "hook_type": hook_type,
-            "reason": candidate.get("reason") or "Selected for a clean scene, useful context, and strong pacing.",
-        })
-    ranked.sort(key=lambda item: (
-        item["virality_score"] * 0.65 + item["completion_score"] * 0.35), reverse=True)
-    return _dedupe_clips(ranked, limit=target_count, overlap_threshold=0.45)
+    return shorts_director.rank_candidates_fallback(candidates, target_count=target_count)
 
 
 def _extract_json_array(text: str) -> list:
@@ -1504,26 +1503,7 @@ def _extract_json_array(text: str) -> list:
 def rank_candidates_with_llm(candidates: list[dict], ai_model: str, target_count: int = 5) -> list[dict]:
     if not candidates:
         return []
-    payload_candidates = [
-        {
-            "id": idx,
-            "start": round(candidate["start"], 2),
-            "end": round(candidate["end"], 2),
-            "duration": round(candidate["duration"], 2),
-            "text": candidate["text"][:1800],
-            "pre_score": candidate["pre_score"],
-            "completion_score": candidate["completion_score"],
-        }
-        for idx, candidate in enumerate(candidates[:20], start=1)
-    ]
-    prompt = (
-        "You are a short-form video editor. Rank these candidate scenes and trim each selected scene "
-        "to the shortest complete clip. Prefer 25-90 seconds, but allow up to 300 seconds only when "
-        "needed for context or payoff. Choose clips that are self-contained, start cleanly, end cleanly, "
-        "and have viral potential. Return ONLY a JSON object with a clips array. Each clip must contain: candidate_id, start, "
-        "end, title, virality_score 0-100, completion_score 0-100, hook_type, reason. "
-        f"Return at most {target_count} clips.\n\nCandidates:\n{json.dumps(payload_candidates)}"
-    )
+    prompt = shorts_director.build_director_prompt(candidates, target_count=target_count)
     try:
         if ai_model == "groq" and GROQ_API_KEY:
             with httpx.Client(timeout=90) as client:
@@ -1568,35 +1548,12 @@ def rank_candidates_with_llm(candidates: list[dict], ai_model: str, target_count
 
 
 def _merge_llm_rankings(candidates: list[dict], llm_items: list, target_count: int) -> list[dict]:
-    by_id = {idx: candidate for idx,
-             candidate in enumerate(candidates[:20], start=1)}
-    clips = []
-    for item in llm_items or []:
-        try:
-            candidate = by_id.get(int(item.get("candidate_id")))
-            if not candidate:
-                continue
-            start = max(float(candidate["start"]), float(
-                item.get("start", candidate["start"])))
-            end = min(float(candidate["end"]), float(
-                item.get("end", candidate["end"])))
-            if end - start < 12:
-                start, end = float(candidate["start"]), float(candidate["end"])
-            clip = {
-                **candidate,
-                "start": start,
-                "end": end,
-                "duration": end - start,
-                "title": str(item.get("title") or "Untitled highlight")[:120],
-                "virality_score": _clamp_score(float(item.get("virality_score", candidate["virality_score"]))),
-                "completion_score": _clamp_score(float(item.get("completion_score", candidate["completion_score"]))),
-                "hook_type": str(item.get("hook_type") or candidate["hook_type"])[:40],
-                "reason": str(item.get("reason") or "Selected by LLM ranking.")[:500],
-            }
-            clips.append(clip)
-        except Exception:
-            continue
-    return rank_candidates_fallback(clips, target_count=target_count) if clips else rank_candidates_fallback(candidates, target_count=target_count)
+    return shorts_director.merge_llm_rankings(
+        candidates,
+        llm_items,
+        target_count=target_count,
+        preset=preset_config_for_export(),
+    )
 
 
 def build_clips_from_segments(
@@ -1608,13 +1565,26 @@ def build_clips_from_segments(
 ) -> list[dict]:
     if not segments:
         return []
-    candidates = build_scene_candidates(
+    source_duration = max((float(seg.get("end", 0)) for seg in segments), default=0)
+    config = preset_config_for_export({
+        "min_clip_duration": min_duration,
+        "hard_max_clip_duration": max_duration,
+        "allow_three_minute_shorts": max_duration > 180,
+    })
+    candidates = shorts_director.build_director_candidates(
         segments,
-        min_duration=max(12, min_duration),
-        hard_max_duration=max_duration,
+        duration=source_duration,
+        preset=config,
         limit=max(20, target_count * 5),
     )
-    return rank_candidates_with_llm(candidates, ai_model=ai_model, target_count=target_count)
+    ranked = rank_candidates_with_llm(candidates, ai_model=ai_model, target_count=target_count)
+    return shorts_director.finalize_director_clips(
+        ranked,
+        segments,
+        source_duration,
+        config,
+        target_count=target_count,
+    )
 
 
 def target_clip_count_for_duration(duration: float) -> int:
@@ -1628,62 +1598,38 @@ def target_clip_count_for_duration(duration: float) -> int:
 
 
 def complete_short_clip(segments: list[dict], duration: float) -> list[dict]:
-    text = " ".join(seg.get("text", "").strip()
-                    for seg in segments if seg.get("text", "").strip())
-    virality, completion, _ = _candidate_scores(
-        text, duration) if text else (65, 90, "complete_short")
-    return [{
-        "start": 0,
-        "end": duration,
-        "duration": duration,
-        "text": text,
-        "title": "Complete short",
-        "virality_score": virality,
-        "completion_score": max(90, completion),
-        "hook_type": "complete_short",
-        "reason": "The source video is already short, so it is kept as one complete clip instead of being split.",
-    }]
+    return shorts_director.complete_short_clip(segments, duration)
 
 
 def select_clips_for_video(segments: list[dict], duration: float, ai_model: str) -> list[dict]:
     if duration <= 90:
         return complete_short_clip(segments, duration)
     target_count = target_clip_count_for_duration(duration)
-    return build_clips_from_segments(segments, target_count=target_count, ai_model=ai_model)
+    config = preset_config_for_export()
+    candidates = shorts_director.build_director_candidates(
+        segments,
+        duration=duration,
+        preset=config,
+        limit=max(20, target_count * 5),
+    )
+    ranked = rank_candidates_with_llm(candidates, ai_model=ai_model, target_count=target_count)
+    selected = shorts_director.finalize_director_clips(
+        ranked,
+        segments,
+        duration,
+        config,
+        target_count=target_count,
+    )
+    return selected or shorts_director.select_director_clips(
+        segments,
+        duration=duration,
+        ai_model=ai_model,
+        preset=config,
+    )
 
 
 def fallback_clips(duration: float, count: int = 5) -> list[dict]:
-    if duration <= 90:
-        return [{
-            "start": 0,
-            "end": duration,
-            "text": "",
-            "title": "Complete short",
-            "virality_score": 50,
-            "completion_score": 90,
-            "hook_type": "complete_short",
-            "reason": "The source video is already short, so fallback kept it as one complete clip.",
-        }]
-    clip_duration = 35.0
-    skip_start = 60.0 if duration > 180 else 0.0
-    usable = duration - skip_start - 30
-    count = min(count, target_clip_count_for_duration(duration))
-    if usable < clip_duration:
-        count = max(1, int(usable // clip_duration)) or 1
-    step = usable / count
-    return [
-        {
-            "start": skip_start + i * step,
-            "end": min(skip_start + i * step + clip_duration, duration - 5),
-            "text": "",
-            "title": f"Fallback clip {i + 1}",
-            "virality_score": 50,
-            "completion_score": 50,
-            "hook_type": "fallback",
-            "reason": "Generated from fallback spacing because transcript ranking was unavailable.",
-        }
-        for i in range(count)
-    ]
+    return shorts_director.fallback_clips(duration, count=count)
 
 # ---------------------------------------------------------------------------
 # SRT generation
@@ -1849,7 +1795,7 @@ def _process_video_sync(
 
     try:
         db_write(
-            "UPDATE videos SET status='processing', steps_json=?, updated_at=datetime('now') WHERE id=?",
+            "UPDATE videos SET status='processing', error_message=NULL, steps_json=?, updated_at=datetime('now') WHERE id=?",
             (json.dumps(steps), video_id),
         )
 
@@ -1984,29 +1930,43 @@ def _process_video_sync(
                 Path(srt_path).write_text(srt_content)
             out_filename = f"{safe_id}_short_{idx:02d}.mp4"
             if export_short_clip(source_path, str(OUTPUTS_DIR / out_filename), start, clip_dur, srt_path, video_id=video_id):
-                title = clip.get("title", f"Highlight {idx}")[:120]
+                enriched_clip = shorts_director.enrich_clip_metadata({
+                    **clip,
+                    "title": clip.get("title") or f"Highlight {idx}",
+                })
+                title = enriched_clip.get("title", f"Highlight {idx}")[:120]
+                description = enriched_clip.get("description", "")[:500]
+                upload_title = enriched_clip.get("upload_title") or title
+                upload_description = enriched_clip.get("upload_description", "")[:700]
+                selection_reason = (
+                    enriched_clip.get("selection_reason")
+                    or enriched_clip.get("reason")
+                    or ""
+                )[:500]
                 db_write(
                     "INSERT INTO shorts "
-                    "(video_id, filename, start_time, end_time, duration, caption_text, title, "
+                    "(video_id, filename, start_time, end_time, duration, caption_text, title, description, "
                     "virality_score, completion_score, hook_type, selection_reason, status, "
-                    "original_start_time, original_end_time, upload_title, updated_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))",
+                    "original_start_time, original_end_time, upload_title, upload_description, updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))",
                     (
                         video_id,
                         out_filename,
                         start,
                         end,
                         clip_dur,
-                        clip.get("text", "")[:500],
+                        enriched_clip.get("text", "")[:500],
                         title,
-                        int(clip.get("virality_score", 0) or 0),
-                        int(clip.get("completion_score", 0) or 0),
-                        clip.get("hook_type", "")[:40],
-                        clip.get("reason", "")[:500],
+                        description,
+                        int(enriched_clip.get("virality_score", 0) or 0),
+                        int(enriched_clip.get("completion_score", 0) or 0),
+                        enriched_clip.get("hook_type", "")[:40],
+                        selection_reason,
                         "draft",
                         start,
                         end,
-                        title,
+                        upload_title[:120],
+                        upload_description,
                     ),
                 )
                 generated += 1
@@ -2019,7 +1979,7 @@ def _process_video_sync(
 
         step(4, "done", f"{generated} Short clips ready")
         db_write(
-            "UPDATE videos SET status='completed', updated_at=datetime('now') WHERE id=?",
+            "UPDATE videos SET status='completed', error_message=NULL, updated_at=datetime('now') WHERE id=?",
             (video_id,),
         )
 
@@ -2060,7 +2020,7 @@ def _download_and_process_sync(video_id: int, captions_enabled: bool = True):
     dl_steps = [{"name": "Download video from YouTube",
                  "status": "running", "detail": "Starting yt-dlp…"}]
     db_write(
-        "UPDATE videos SET status='downloading', steps_json=?, updated_at=datetime('now') WHERE id=?",
+        "UPDATE videos SET status='downloading', error_message=NULL, steps_json=?, updated_at=datetime('now') WHERE id=?",
         (json.dumps(dl_steps), video_id),
     )
 
@@ -2075,15 +2035,18 @@ def _download_and_process_sync(video_id: int, captions_enabled: bool = True):
         finish_video_job(video_id)
         return
 
-    cmd = [
-        "yt-dlp",
-        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
-        "--merge-output-format", "mp4",
-        "-o", output_path,
-        "--no-playlist",
-        "--newline",
-        f"https://www.youtube.com/watch?v={yt_id}",
-    ]
+    missing_runtime = missing_ytdlp_runtime_message()
+    if missing_runtime:
+        dl_steps[0]["status"] = "error"
+        dl_steps[0]["detail"] = missing_runtime
+        db_write(
+            "UPDATE videos SET status='failed', error_message=?, steps_json=?, updated_at=datetime('now') WHERE id=?",
+            (missing_runtime, json.dumps(dl_steps), video_id),
+        )
+        finish_video_job(video_id)
+        return
+
+    cmd = build_ytdlp_download_command(yt_id, output_path)
     try:
         result = run_command(cmd, timeout=1800, video_id=video_id)
         if result.returncode != 0:

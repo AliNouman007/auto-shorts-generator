@@ -4,6 +4,7 @@ from unittest import mock
 from starlette.requests import Request
 
 import main
+from services import shorts_director
 
 
 class ExportFilterTest(unittest.TestCase):
@@ -46,6 +47,28 @@ class ExportFilterTest(unittest.TestCase):
         self.assertIn("libx264", command)
         self.assertEqual("veryfast", command[command.index("-preset") + 1])
         self.assertEqual("24", command[command.index("-crf") + 1])
+
+
+class YoutubeDownloadCommandTest(unittest.TestCase):
+    def test_ytdlp_command_uses_available_node_runtime(self):
+        with mock.patch.object(main.shutil, "which") as which:
+            which.side_effect = lambda command: {
+                "node": "/usr/bin/node",
+                "deno": None,
+                "yt-dlp": "/usr/bin/yt-dlp",
+            }.get(command)
+
+            command = main.build_ytdlp_download_command("abc123", "uploads/out.mp4")
+
+        self.assertIn("--js-runtimes", command)
+        self.assertEqual("node:/usr/bin/node", command[command.index("--js-runtimes") + 1])
+
+    def test_missing_ytdlp_js_runtime_returns_actionable_error(self):
+        with mock.patch.object(main.shutil, "which", return_value=None):
+            message = main.missing_ytdlp_runtime_message()
+
+        self.assertIn("JavaScript runtime", message)
+        self.assertIn("Node.js", message)
 
 
 class CaptionTranscriptionTest(unittest.TestCase):
@@ -156,8 +179,146 @@ class ProcessingCaptionToggleTest(unittest.TestCase):
         self.assertIsNone(export_short_clip.call_args.args[4])
         self.assertFalse((main.OUTPUTS_DIR / "unit_no_captions_short_01.srt").exists())
 
+    def test_processing_stores_director_upload_metadata(self):
+        source_path = main.UPLOADS_DIR / "unit_director_metadata.mp4"
+        source_path.write_text("source")
+        main.db_write(
+            "INSERT INTO videos (youtube_video_id, title, source_path, status) VALUES (?,?,?,'waiting')",
+            ("unit_director_metadata", "Director metadata", str(source_path)),
+        )
+        video_id = main.db_read(
+            "SELECT id FROM videos WHERE youtube_video_id=?",
+            ("unit_director_metadata",),
+        )[0]["id"]
+        self.addCleanup(lambda: main.db_write("DELETE FROM shorts WHERE video_id=?", (video_id,)))
+        self.addCleanup(lambda: main.db_write("DELETE FROM videos WHERE id=?", (video_id,)))
+        self.addCleanup(lambda: source_path.unlink(missing_ok=True))
+
+        clip = {
+            "start": 0,
+            "end": 12,
+            "text": "Most people make this mistake. Here is the fix.",
+            "title": "Fix This Shorts Mistake",
+            "description": "A short explanation of the mistake and the fix.",
+            "upload_title": "Fix This Shorts Mistake",
+            "upload_description": "Most creators keep the slow setup. Cut to the result first. #shorts #editing #creator",
+            "virality_score": 84,
+            "completion_score": 88,
+            "hook_type": "problem_solution",
+            "selection_reason": "Clear hook and payoff.",
+        }
+        with (
+            mock.patch.object(main, "missing_tools_message", return_value=""),
+            mock.patch.object(main, "is_valid_video", return_value=True),
+            mock.patch.object(main, "get_video_duration", return_value=30),
+            mock.patch.object(main, "extract_audio", return_value=True),
+            mock.patch.object(main, "transcribe_with_whisper_local", return_value=[clip]),
+            mock.patch.object(main, "select_clips_for_video", return_value=[clip]),
+            mock.patch.object(main, "export_short_clip", return_value=True),
+        ):
+            main._process_video_sync(video_id, str(source_path), captions_enabled=False)
+
+        short = main.db_read(
+            "SELECT title, description, upload_title, upload_description, selection_reason FROM shorts WHERE video_id=?",
+            (video_id,),
+        )[0]
+        self.assertEqual("Fix This Shorts Mistake", short["title"])
+        self.assertEqual("A short explanation of the mistake and the fix.", short["description"])
+        self.assertEqual("Fix This Shorts Mistake", short["upload_title"])
+        self.assertIn("#shorts", short["upload_description"])
+        self.assertEqual("Clear hook and payoff.", short["selection_reason"])
+
 
 class ClipSelectionTest(unittest.TestCase):
+    def test_director_prompt_requires_hcvp_json_metadata(self):
+        candidates = [{
+            "candidate_id": 1,
+            "start": 12,
+            "end": 58,
+            "duration": 46,
+            "text": "Most people make this mistake. Here is the fix. That is the payoff.",
+            "pre_score": 80,
+            "completion_score": 82,
+        }]
+
+        prompt = shorts_director.build_director_prompt(candidates, target_count=1)
+
+        self.assertIn("Hook", prompt)
+        self.assertIn("Context", prompt)
+        self.assertIn("Value", prompt)
+        self.assertIn("Payoff", prompt)
+        self.assertIn("upload_title", prompt)
+        self.assertIn("upload_description", prompt)
+        self.assertIn("strict JSON", prompt)
+
+    def test_director_clips_include_review_and_upload_metadata(self):
+        segments = [
+            {"start": 0, "end": 8, "text": "Most creators lose viewers in the first two seconds."},
+            {"start": 8.5, "end": 23, "text": "The problem is they keep the slow setup before showing the result."},
+            {"start": 23.2, "end": 41, "text": "Cut straight to the mistake, then explain the context after the viewer is curious."},
+            {"start": 41.3, "end": 58, "text": "That one change makes the Short feel faster and keeps people watching."},
+        ]
+
+        clips = shorts_director.select_director_clips(segments, duration=58, ai_model="openai")
+
+        self.assertEqual(1, len(clips))
+        for field in (
+            "title",
+            "description",
+            "upload_title",
+            "upload_description",
+            "hook",
+            "context",
+            "value",
+            "payoff",
+            "selection_reason",
+        ):
+            self.assertTrue(clips[0].get(field), field)
+        self.assertLessEqual(len(clips[0]["upload_title"]), 60)
+
+    def test_director_validation_downgrades_filler_intro(self):
+        segments = [
+            {"start": 0, "end": 9, "text": "Hello guys so basically today we are going to start."},
+            {"start": 9.2, "end": 32, "text": "The real mistake is keeping slow setup before the useful answer."},
+        ]
+        clip = {
+            "start": 0,
+            "end": 32,
+            "duration": 32,
+            "text": "Hello guys so basically today we are going to start. The real mistake is keeping slow setup before the useful answer.",
+            "virality_score": 80,
+            "completion_score": 80,
+        }
+
+        validation = shorts_director.validate_clip_structure(clip, segments, {})
+
+        self.assertFalse(validation["valid"])
+        self.assertIn("filler_intro", validation["issues"])
+        self.assertLess(validation["score"], 80)
+
+    def test_director_snaps_clip_to_transcript_segment_boundaries(self):
+        segments = [
+            {"start": 10, "end": 20, "text": "Here is the hook."},
+            {"start": 20.4, "end": 35, "text": "Here is the payoff."},
+        ]
+        clip = {"start": 12, "end": 32, "duration": 20, "text": "Here is the hook. Here is the payoff."}
+
+        snapped = shorts_director.snap_clip_to_segment_boundaries(clip, segments)
+
+        self.assertEqual(10, snapped["start"])
+        self.assertAlmostEqual(35.25, snapped["end"])
+
+    def test_director_candidates_respect_default_hard_max(self):
+        segments = [
+            {"start": i * 20, "end": (i + 1) * 20 - 1, "text": f"Here is useful point {i}. It explains one mistake and the fix."}
+            for i in range(14)
+        ]
+
+        candidates = shorts_director.build_director_candidates(segments, duration=280, preset={})
+
+        self.assertTrue(candidates)
+        self.assertTrue(all(candidate["duration"] <= 180 for candidate in candidates))
+
     def test_scene_candidates_preserve_complete_multi_sentence_moment(self):
         segments = [
             {"start": 0, "end": 8, "text": "Today I learned something surprising."},
@@ -309,6 +470,37 @@ class VideoActionsTest(unittest.TestCase):
         self.assertEqual("detected", video["status"])
         self.assertEqual("", video["source_path"])
         self.assertEqual([], main.db_read("SELECT id FROM shorts WHERE video_id=?", (self.video_id,)))
+
+    def test_successful_processing_clears_previous_error_message(self):
+        main.db_write(
+            "UPDATE videos SET error_message=?, status='waiting' WHERE id=?",
+            ("old yt-dlp 403 error", self.video_id),
+        )
+        clip = {
+            "start": 0,
+            "end": 10,
+            "text": "Recovered after retry.",
+            "title": "Recovered clip",
+            "virality_score": 70,
+            "completion_score": 80,
+            "hook_type": "useful",
+            "reason": "Retry succeeded.",
+        }
+
+        with (
+            mock.patch.object(main, "missing_tools_message", return_value=""),
+            mock.patch.object(main, "is_valid_video", return_value=True),
+            mock.patch.object(main, "get_video_duration", return_value=30),
+            mock.patch.object(main, "extract_audio", return_value=True),
+            mock.patch.object(main, "transcribe_with_whisper_local", return_value=[clip]),
+            mock.patch.object(main, "select_clips_for_video", return_value=[clip]),
+            mock.patch.object(main, "export_short_clip", return_value=True),
+        ):
+            main._process_video_sync(self.video_id, str(self.source_path), captions_enabled=False)
+
+        video = main.db_read("SELECT status, error_message FROM videos WHERE id=?", (self.video_id,))[0]
+        self.assertEqual("completed", video["status"])
+        self.assertIsNone(video["error_message"])
 
 class DashboardRenderingTest(unittest.TestCase):
     def test_waiting_video_shows_generate_without_download_generate(self):
