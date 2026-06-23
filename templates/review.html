@@ -1,0 +1,634 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Review Short — {{ short.title or short.filename }}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css?v=7" />
+  <style>
+    .review-layout {
+      display: grid;
+      grid-template-columns: 340px 1fr;
+      gap: 2rem;
+      max-width: 1100px;
+      margin: 2rem auto;
+      padding: 0 1.5rem;
+      align-items: start;
+    }
+    @media (max-width: 780px) {
+      .review-layout { grid-template-columns: 1fr; }
+    }
+    .review-player-col {
+      position: sticky;
+      top: 80px;
+    }
+    .review-player-wrap {
+      background: #000;
+      border-radius: var(--radius);
+      overflow: hidden;
+      aspect-ratio: 9/16;
+      width: 100%;
+      max-width: 340px;
+      box-shadow: var(--shadow);
+    }
+    .review-player-wrap video {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+    }
+    .review-player-actions {
+      display: flex;
+      gap: 0.5rem;
+      margin-top: 0.75rem;
+      flex-wrap: wrap;
+    }
+    .review-edit-col {
+      display: flex;
+      flex-direction: column;
+      gap: 1.25rem;
+    }
+    .review-header {
+      display: flex;
+      align-items: flex-start;
+      gap: 1rem;
+      flex-wrap: wrap;
+    }
+    .review-header-text { flex: 1; min-width: 0; }
+    .review-title-display {
+      font-size: 1.25rem;
+      font-weight: 700;
+      line-height: 1.3;
+      word-break: break-word;
+    }
+    .review-source-link {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      margin-top: 0.25rem;
+    }
+    .review-source-link a { color: var(--accent); text-decoration: none; }
+    .review-source-link a:hover { text-decoration: underline; }
+    .short-status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      padding: 0.3rem 0.75rem;
+      border-radius: 20px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      flex-shrink: 0;
+    }
+    .short-status-badge.draft     { background: #334155; color: #94a3b8; }
+    .short-status-badge.approved  { background: #14532d; color: #4ade80; }
+    .short-status-badge.rejected  { background: #450a0a; color: #f87171; }
+    .short-status-badge.regenerating { background: #1e3a5f; color: #60a5fa; }
+    .short-status-badge.failed    { background: #450a0a; color: #f87171; }
+    .short-status-badge.exported  { background: #1a2e50; color: #93c5fd; }
+    .short-status-badge.uploaded  { background: #14532d; color: #4ade80; }
+
+    .ai-meta-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1rem;
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+      gap: 0.75rem;
+    }
+    .ai-meta-item label {
+      display: block;
+      font-size: 0.7rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 0.2rem;
+    }
+    .ai-meta-item .ai-meta-val {
+      font-size: 0.9rem;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .ai-meta-item .ai-meta-val.score-high { color: #4ade80; }
+    .ai-meta-item .ai-meta-val.score-mid  { color: #fbbf24; }
+    .ai-meta-item .ai-meta-val.score-low  { color: #f87171; }
+    .selection-reason-box {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 0.85rem 1rem;
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      line-height: 1.6;
+    }
+    .selection-reason-box strong {
+      display: block;
+      color: var(--text);
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 0.4rem;
+    }
+    .edit-section {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.25rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+    }
+    .edit-section-title {
+      font-size: 0.75rem;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+    }
+    .field-row { display: flex; flex-direction: column; gap: 0.35rem; }
+    .field-row label { font-size: 0.8rem; color: var(--text-muted); }
+    .field-input, .field-textarea {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      font-family: inherit;
+      font-size: 0.875rem;
+      padding: 0.5rem 0.7rem;
+      width: 100%;
+      transition: border-color 0.15s;
+    }
+    .field-input:focus, .field-textarea:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+    .field-textarea {
+      resize: vertical;
+      min-height: 90px;
+      line-height: 1.5;
+    }
+    .time-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.75rem;
+    }
+    .time-input-wrap {
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
+    }
+    .time-input-wrap label { font-size: 0.8rem; color: var(--text-muted); }
+    .time-adj {
+      display: flex;
+      gap: 0.35rem;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .time-adj .field-input {
+      flex: 1;
+      min-width: 60px;
+    }
+    .adj-btn {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      border-radius: 5px;
+      padding: 0.35rem 0.55rem;
+      font-size: 0.8rem;
+      cursor: pointer;
+      transition: background 0.15s, color 0.15s;
+      white-space: nowrap;
+    }
+    .adj-btn:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
+    .time-original {
+      font-size: 0.72rem;
+      color: var(--text-dim);
+    }
+    .approve-reject-row {
+      display: flex;
+      gap: 0.6rem;
+      flex-wrap: wrap;
+    }
+    .btn-approve {
+      background: #14532d;
+      color: #4ade80;
+      border: 1px solid #166534;
+    }
+    .btn-approve:hover { background: #166534; }
+    .btn-reject {
+      background: #450a0a;
+      color: #f87171;
+      border: 1px solid #7f1d1d;
+    }
+    .btn-reject:hover { background: #7f1d1d; }
+    .save-row {
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .save-indicator {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+    }
+    .back-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      color: var(--text-muted);
+      text-decoration: none;
+      font-size: 0.85rem;
+      padding: 0.5rem 0;
+      transition: color 0.15s;
+    }
+    .back-link:hover { color: var(--text); }
+    .review-topbar {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 0.75rem 1.5rem 0;
+    }
+    .regen-note {
+      font-size: 0.78rem;
+      color: var(--text-muted);
+      margin-top: 0.25rem;
+    }
+  </style>
+</head>
+<body>
+
+<header class="header">
+  <div class="header-inner">
+    <a href="/" class="logo">
+      <div class="logo-icon">✂</div>
+      Auto Shorts Studio
+    </a>
+  </div>
+</header>
+
+<div class="review-topbar">
+  <a href="/" class="back-link">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+    Back to Dashboard
+  </a>
+</div>
+
+<div class="review-layout">
+
+  <!-- LEFT: Video player -->
+  <div class="review-player-col">
+    <div class="review-player-wrap">
+      <video id="review-video" src="/outputs/{{ short.filename }}" controls playsinline preload="metadata"></video>
+    </div>
+    <div class="review-player-actions">
+      <a href="/download/{{ short.filename }}" class="btn btn-ghost btn-sm" style="text-decoration:none;flex:1;justify-content:center" download>
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        Download
+      </a>
+    </div>
+  </div>
+
+  <!-- RIGHT: Edit panel -->
+  <div class="review-edit-col">
+
+    <!-- Header -->
+    <div class="review-header">
+      <div class="review-header-text">
+        <div class="review-title-display" id="display-title">{{ short.title or short.filename }}</div>
+        {% if video.title or video.youtube_video_id %}
+        <div class="review-source-link">
+          From:
+          {% if video.youtube_video_id %}
+          <a href="https://youtube.com/watch?v={{ video.youtube_video_id }}" target="_blank" rel="noopener">
+            {{ video.title or video.youtube_video_id }}
+          </a>
+          {% else %}
+          {{ video.title }}
+          {% endif %}
+        </div>
+        {% endif %}
+      </div>
+      <span class="short-status-badge {{ short.status or 'draft' }}" id="status-badge">
+        {{ short.status or 'draft' }}
+      </span>
+    </div>
+
+    <!-- Approve / Reject -->
+    <div class="approve-reject-row">
+      <button class="btn btn-approve" id="btn-approve" onclick="approveShort()">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+        Approve
+      </button>
+      <button class="btn btn-reject" id="btn-reject" onclick="rejectShort()">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        Reject
+      </button>
+    </div>
+
+    <!-- AI metadata -->
+    {% if short.virality_score is not none or short.completion_score is not none or short.hook_type or short.duration %}
+    <div class="ai-meta-card">
+      {% if short.duration %}
+      <div class="ai-meta-item">
+        <label>Duration</label>
+        <div class="ai-meta-val">{{ '%.1f'|format(short.duration) }}s</div>
+      </div>
+      {% endif %}
+      {% if short.start_time is not none %}
+      <div class="ai-meta-item">
+        <label>Clip range</label>
+        <div class="ai-meta-val">{{ '%.0f'|format(short.start_time) }}s – {{ '%.0f'|format(short.end_time) }}s</div>
+      </div>
+      {% endif %}
+      {% if short.virality_score is not none %}
+      <div class="ai-meta-item">
+        <label>Virality</label>
+        <div class="ai-meta-val {% if short.virality_score >= 70 %}score-high{% elif short.virality_score >= 40 %}score-mid{% else %}score-low{% endif %}">
+          {{ short.virality_score }}%
+        </div>
+      </div>
+      {% endif %}
+      {% if short.completion_score is not none %}
+      <div class="ai-meta-item">
+        <label>Completion</label>
+        <div class="ai-meta-val {% if short.completion_score >= 70 %}score-high{% elif short.completion_score >= 40 %}score-mid{% else %}score-low{% endif %}">
+          {{ short.completion_score }}%
+        </div>
+      </div>
+      {% endif %}
+      {% if short.hook_type %}
+      <div class="ai-meta-item">
+        <label>Hook type</label>
+        <div class="ai-meta-val">{{ short.hook_type }}</div>
+      </div>
+      {% endif %}
+    </div>
+    {% endif %}
+
+    {% if short.selection_reason %}
+    <div class="selection-reason-box">
+      <strong>AI Selection Reason</strong>
+      {{ short.selection_reason }}
+    </div>
+    {% endif %}
+
+    <!-- Edit fields -->
+    <div class="edit-section">
+      <div class="edit-section-title">Edit metadata</div>
+
+      <div class="field-row">
+        <label for="edit-title">Title</label>
+        <input type="text" id="edit-title" class="field-input" maxlength="120" value="{{ short.title or '' }}" placeholder="Short title…" />
+      </div>
+
+      <div class="field-row">
+        <label for="edit-description">Description</label>
+        <textarea id="edit-description" class="field-textarea" rows="3" maxlength="1000" placeholder="Short description for upload…">{{ short.description or '' }}</textarea>
+      </div>
+
+      <div class="field-row">
+        <label for="edit-caption">Caption text (burned-in subtitles)</label>
+        <textarea id="edit-caption" class="field-textarea" rows="4" maxlength="2000" placeholder="Caption text shown as subtitles…">{{ short.caption_text or '' }}</textarea>
+      </div>
+
+      <div class="save-row">
+        <button class="btn btn-primary btn-sm" onclick="saveEdits()">Save changes</button>
+        <span class="save-indicator" id="save-indicator"></span>
+      </div>
+    </div>
+
+    <!-- Clip timing -->
+    <div class="edit-section">
+      <div class="edit-section-title">Clip timing</div>
+      <div class="time-row">
+        <div class="time-input-wrap">
+          <label>Start (seconds)</label>
+          <div class="time-adj">
+            <button class="adj-btn" onclick="adjustTime('start', -1)">−1s</button>
+            <input type="number" id="edit-start" class="field-input" step="0.5" min="0" value="{{ '%.2f'|format(short.start_time or 0) }}" />
+            <button class="adj-btn" onclick="adjustTime('start', 1)">+1s</button>
+          </div>
+          {% if short.original_start_time is not none and short.original_start_time != short.start_time %}
+          <div class="time-original">AI original: {{ '%.1f'|format(short.original_start_time) }}s</div>
+          {% endif %}
+        </div>
+        <div class="time-input-wrap">
+          <label>End (seconds)</label>
+          <div class="time-adj">
+            <button class="adj-btn" onclick="adjustTime('end', -1)">−1s</button>
+            <input type="number" id="edit-end" class="field-input" step="0.5" min="0" value="{{ '%.2f'|format(short.end_time or 0) }}" />
+            <button class="adj-btn" onclick="adjustTime('end', 1)">+1s</button>
+          </div>
+          {% if short.original_end_time is not none and short.original_end_time != short.end_time %}
+          <div class="time-original">AI original: {{ '%.1f'|format(short.original_end_time) }}s</div>
+          {% endif %}
+        </div>
+      </div>
+      <div class="save-row" style="margin-top:0.25rem">
+        <button class="btn btn-secondary btn-sm" onclick="saveTimings()">Save timings</button>
+        <span class="save-indicator" id="timing-indicator"></span>
+      </div>
+      <div class="regen-note">
+        After saving timings or caption edits, use "Re-export clip" to generate a new video with your changes.
+      </div>
+      <button class="btn btn-primary btn-sm" id="btn-regen" onclick="regenerateShort()" style="margin-top:0.25rem">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+        Re-export clip
+      </button>
+    </div>
+
+  </div>
+</div>
+
+<div id="toast-area"></div>
+<script>
+const SHORT_ID = {{ short.id }};
+
+function showToast(message, type = 'info', duration = 4500) {
+  const area = document.getElementById('toast-area');
+  const toast = document.createElement('div');
+  toast.className = `toast ${type}`;
+  toast.textContent = message;
+  area.appendChild(toast);
+  setTimeout(() => {
+    toast.style.opacity = '0';
+    toast.style.transform = 'translateY(8px)';
+    toast.style.transition = 'opacity 0.3s, transform 0.3s';
+    setTimeout(() => toast.remove(), 300);
+  }, duration);
+}
+
+function setStatusBadge(status) {
+  const badge = document.getElementById('status-badge');
+  if (!badge) return;
+  badge.className = `short-status-badge ${status}`;
+  badge.textContent = status;
+}
+
+async function approveShort() {
+  const btn = document.getElementById('btn-approve');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin"></span> Approving…';
+  try {
+    const res = await fetch(`/shorts/${SHORT_ID}/approve`, { method: 'POST' });
+    if (!res.ok) { showToast('Failed to approve', 'error'); return; }
+    setStatusBadge('approved');
+    showToast('Short approved!', 'success');
+  } catch(e) {
+    showToast('Network error', 'error');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg> Approve';
+  }
+}
+
+async function rejectShort() {
+  const btn = document.getElementById('btn-reject');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin"></span> Rejecting…';
+  try {
+    const res = await fetch(`/shorts/${SHORT_ID}/reject`, { method: 'POST' });
+    if (!res.ok) { showToast('Failed to reject', 'error'); return; }
+    setStatusBadge('rejected');
+    showToast('Short rejected.', 'info');
+  } catch(e) {
+    showToast('Network error', 'error');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg> Reject';
+  }
+}
+
+async function saveEdits() {
+  const title = document.getElementById('edit-title').value.trim();
+  const description = document.getElementById('edit-description').value.trim();
+  const caption_text = document.getElementById('edit-caption').value.trim();
+  const ind = document.getElementById('save-indicator');
+  ind.textContent = 'Saving…';
+  try {
+    const res = await fetch(`/shorts/${SHORT_ID}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title, description, caption_text }),
+    });
+    if (!res.ok) {
+      ind.textContent = 'Save failed.';
+      showToast('Failed to save edits', 'error');
+      return;
+    }
+    const updated = await res.json();
+    document.getElementById('display-title').textContent = updated.title || updated.filename;
+    ind.textContent = 'Saved ✓';
+    showToast('Changes saved', 'success');
+    setTimeout(() => { if (ind.textContent === 'Saved ✓') ind.textContent = ''; }, 3000);
+  } catch(e) {
+    ind.textContent = 'Save failed.';
+    showToast('Network error', 'error');
+  }
+}
+
+async function saveTimings() {
+  const start = parseFloat(document.getElementById('edit-start').value);
+  const end = parseFloat(document.getElementById('edit-end').value);
+  const ind = document.getElementById('timing-indicator');
+  if (isNaN(start) || isNaN(end) || end <= start) {
+    showToast('End must be greater than start', 'error');
+    return;
+  }
+  if (end - start < 3) {
+    showToast('Clip must be at least 3 seconds', 'error');
+    return;
+  }
+  ind.textContent = 'Saving…';
+  try {
+    const res = await fetch(`/shorts/${SHORT_ID}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ start_time: start, end_time: end }),
+    });
+    if (!res.ok) { ind.textContent = 'Save failed.'; showToast('Failed to save timings', 'error'); return; }
+    ind.textContent = 'Saved ✓';
+    showToast('Timings saved — click Re-export to apply.', 'success');
+    setTimeout(() => { if (ind.textContent === 'Saved ✓') ind.textContent = ''; }, 3000);
+  } catch(e) {
+    ind.textContent = 'Save failed.';
+    showToast('Network error', 'error');
+  }
+}
+
+function adjustTime(field, delta) {
+  const input = document.getElementById(`edit-${field}`);
+  const val = parseFloat(input.value) || 0;
+  input.value = Math.max(0, val + delta).toFixed(2);
+}
+
+let _regenPoll = null;
+
+async function regenerateShort() {
+  const btn = document.getElementById('btn-regen');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin"></span> Starting re-export…';
+  try {
+    const res = await fetch(`/shorts/${SHORT_ID}/regenerate`, { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) {
+      showToast(data.detail || 'Re-export failed', 'error');
+      btn.disabled = false;
+      btn.textContent = 'Re-export clip';
+      return;
+    }
+    setStatusBadge('regenerating');
+    showToast('Re-exporting clip… this may take a moment.', 'info');
+    _pollRegenStatus();
+  } catch(e) {
+    showToast('Network error starting re-export', 'error');
+    btn.disabled = false;
+    btn.textContent = 'Re-export clip';
+  }
+}
+
+function _pollRegenStatus() {
+  if (_regenPoll) clearInterval(_regenPoll);
+  _regenPoll = setInterval(async () => {
+    try {
+      const res = await fetch(`/shorts/${SHORT_ID}/regen-status`);
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data.status !== 'regenerating') {
+        clearInterval(_regenPoll);
+        _regenPoll = null;
+        setStatusBadge(data.status);
+        if (data.status === 'draft') {
+          showToast('Re-export complete! Reloading video…', 'success');
+          setTimeout(() => {
+            const v = document.getElementById('review-video');
+            v.src = v.src.split('?')[0] + '?t=' + Date.now();
+            _resetRegenBtn();
+          }, 800);
+        } else if (data.status === 'failed') {
+          showToast('Re-export failed — check FFmpeg logs.', 'error');
+          _resetRegenBtn();
+        } else {
+          _resetRegenBtn();
+        }
+      }
+    } catch(e) {}
+  }, 2000);
+}
+
+function _resetRegenBtn() {
+  const btn = document.getElementById('btn-regen');
+  if (!btn) return;
+  btn.disabled = false;
+  btn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg> Re-export clip';
+}
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowLeft')  adjustTime('start', -1);
+  if (e.key === 'ArrowRight') adjustTime('end',   1);
+});
+</script>
+</body>
+</html>
