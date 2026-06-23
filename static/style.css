@@ -383,9 +383,105 @@ body {
   word-break: break-all;
 }
 
+.short-title {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
 .short-meta {
   font-size: 0.72rem;
   color: var(--text-muted);
+}
+
+.short-score-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.score-pill {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.12rem 0.45rem;
+  color: var(--text-muted);
+  font-size: 0.68rem;
+}
+
+.score-viral {
+  border-color: #22c55e40;
+  color: var(--green);
+}
+
+.short-reason {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  line-height: 1.45;
+}
+
+/* ---------- Short player modal ---------- */
+body.modal-open { overflow: hidden; }
+
+.short-player-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 1.25rem;
+}
+
+.short-player-modal.open { display: flex; }
+
+.short-player-backdrop {
+  position: absolute;
+  inset: 0;
+  background: #020617cc;
+}
+
+.short-player-dialog {
+  position: relative;
+  width: min(420px, 100%);
+  max-height: calc(100vh - 2.5rem);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.short-player-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.short-player-title {
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.short-player-filename {
+  max-width: 260px;
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  word-break: break-all;
+}
+
+.short-player-video {
+  width: 100%;
+  max-height: calc(100vh - 8rem);
+  aspect-ratio: 9 / 16;
+  background: #000;
+  border-radius: 8px;
+  outline: none;
 }
 
 /* ---------- Spinner ---------- */
@@ -664,60 +760,6 @@ body {
 }
 
 .step-error .step-detail { color: #fca5a5; }
-
-/* ---------- Short card status pill ---------- */
-.short-card-top {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 0.5rem;
-  margin-bottom: 0.15rem;
-}
-.short-card-top .short-title { flex: 1; min-width: 0; }
-
-.short-status-pill {
-  display: inline-block;
-  padding: 0.15rem 0.5rem;
-  border-radius: 20px;
-  font-size: 0.65rem;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  flex-shrink: 0;
-  white-space: nowrap;
-}
-.short-status-draft        { background: #1e293b; color: #64748b; }
-.short-status-approved     { background: #14532d; color: #4ade80; }
-.short-status-rejected     { background: #450a0a; color: #f87171; }
-.short-status-regenerating { background: #1e3a5f; color: #60a5fa; }
-.short-status-failed       { background: #450a0a; color: #f87171; }
-.short-status-exported     { background: #1e3a5f; color: #93c5fd; }
-.short-status-uploaded     { background: #14532d; color: #4ade80; }
-
-/* Short card action row */
-.short-actions {
-  display: flex;
-  gap: 0.4rem;
-  flex-wrap: wrap;
-  margin-top: 0.4rem;
-  align-items: center;
-}
-
-/* Inline approve / reject icon buttons */
-.short-approve-btn {
-  background: #14532d;
-  border: 1px solid #166534;
-  color: #4ade80;
-  padding: 0.3rem 0.45rem;
-}
-.short-approve-btn:hover { background: #166534; }
-.short-reject-btn {
-  background: #450a0a;
-  border: 1px solid #7f1d1d;
-  color: #f87171;
-  padding: 0.3rem 0.45rem;
-}
-.short-reject-btn:hover { background: #7f1d1d; }
 
 /* ---------- Responsive ---------- */
 @media (max-width: 640px) {
