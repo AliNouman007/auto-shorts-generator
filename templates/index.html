@@ -6,7 +6,7 @@
   <title>Auto Shorts Generator</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css?v=7" />
+  <link rel="stylesheet" href="/static/style.css?v=6" />
 </head>
 <body>
 
@@ -223,13 +223,10 @@
         <div class="shorts-label" id="shorts-label-{{ video.id }}">{{ video.shorts|length }} Short{{ 's' if video.shorts|length != 1 }} Generated</div>
         <div class="shorts-grid" id="shorts-grid-{{ video.id }}">
           {% for short in video.shorts %}
-          <div class="short-card" data-short-id="{{ short.id }}" data-short-status="{{ short.status or 'draft' }}">
-            <div class="short-card-top">
-              {% if short.title %}
-              <div class="short-title">{{ short.title }}</div>
-              {% endif %}
-              <span class="short-status-pill short-status-{{ short.status or 'draft' }}" id="short-status-{{ short.id }}">{{ short.status or 'draft' }}</span>
-            </div>
+          <div class="short-card" data-short-id="{{ short.id }}">
+            {% if short.title %}
+            <div class="short-title">{{ short.title }}</div>
+            {% endif %}
             <div class="short-name">{{ short.filename }}</div>
             <div class="short-meta">
               {% if short.duration %}{{ '%.1f'|format(short.duration) }}s{% endif %}
@@ -251,16 +248,10 @@
             {% if short.selection_reason %}
             <div class="short-reason">{{ short.selection_reason }}</div>
             {% endif %}
-            <div class="short-actions">
-              <a href="/review/{{ short.id }}" class="btn btn-primary btn-sm" style="text-decoration:none">
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
-                Review
-              </a>
-              <button class="btn btn-sm short-approve-btn" onclick="quickApprove({{ short.id }}, this)" title="Approve">
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
-              </button>
-              <button class="btn btn-sm short-reject-btn" onclick="quickReject({{ short.id }}, this)" title="Reject">
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+            <div style="display:flex;gap:0.4rem;flex-wrap:wrap;margin-top:0.25rem">
+              <button class="btn btn-primary btn-sm" onclick='openShortPlayer({{ short.filename|tojson }})'>
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 3 20 12 6 21 6 3"/></svg>
+                Play
               </button>
               <a href="/download/{{ short.filename }}" class="btn btn-ghost btn-sm" style="text-decoration:none" download>
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
@@ -294,7 +285,6 @@
 </div>
 
 <div id="toast-area"></div>
-<script src="/static/app.js?v=7"></script>
+<script src="/static/app.js?v=6"></script>
 </body>
 </html>
-
