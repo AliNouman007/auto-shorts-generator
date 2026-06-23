@@ -20,7 +20,6 @@ from typing import Optional
 import httpx
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Request
 from fastapi.responses import HTMLResponse, FileResponse
-from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -160,12 +159,6 @@ def init_db():
         "ALTER TABLE shorts ADD COLUMN completion_score INTEGER",
         "ALTER TABLE shorts ADD COLUMN hook_type TEXT",
         "ALTER TABLE shorts ADD COLUMN selection_reason TEXT",
-        "ALTER TABLE shorts ADD COLUMN status TEXT DEFAULT 'draft'",
-        "ALTER TABLE shorts ADD COLUMN description TEXT",
-        "ALTER TABLE shorts ADD COLUMN approved_at TEXT",
-        "ALTER TABLE shorts ADD COLUMN updated_at TEXT",
-        "ALTER TABLE shorts ADD COLUMN original_start_time REAL",
-        "ALTER TABLE shorts ADD COLUMN original_end_time REAL",
     ]:
         try:
             conn.execute(col_sql)
@@ -1234,8 +1227,8 @@ def _process_video_sync(video_id: int, source_path: str, source_started_as_downl
             if export_short_clip(source_path, str(OUTPUTS_DIR / out_filename), start, clip_dur, srt_path, video_id=video_id):
                 db_write(
                     "INSERT INTO shorts "
-                    "(video_id, filename, start_time, end_time, duration, caption_text, title, virality_score, completion_score, hook_type, selection_reason, status, original_start_time, original_end_time) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "(video_id, filename, start_time, end_time, duration, caption_text, title, virality_score, completion_score, hook_type, selection_reason) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         video_id,
                         out_filename,
@@ -1248,9 +1241,6 @@ def _process_video_sync(video_id: int, source_path: str, source_started_as_downl
                         int(clip.get("completion_score", 0) or 0),
                         clip.get("hook_type", "")[:40],
                         clip.get("reason", "")[:500],
-                        "draft",
-                        start,
-                        end,
                     ),
                 )
                 generated += 1
@@ -1598,189 +1588,6 @@ async def delete_source_video_route(video_id: int):
     return {"message": "Downloaded video deleted."}
 
 
-# ---------------------------------------------------------------------------
-# Short review / approve / reject / edit / regenerate  (Phase 1)
-# ---------------------------------------------------------------------------
-
-def _fmt_srt_time(seconds: float) -> str:
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    ms = int(round((seconds - int(seconds)) * 1000))
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-
-def caption_text_to_srt(text: str, duration: float) -> str:
-    """Convert plain caption text to a simple SRT, evenly spread across duration."""
-    words = text.split()
-    if not words or duration <= 0:
-        return ""
-    chunk_size = 8
-    chunks = [words[i : i + chunk_size] for i in range(0, len(words), chunk_size)]
-    n = len(chunks)
-    tpc = duration / n
-    lines: list[str] = []
-    for i, chunk in enumerate(chunks):
-        start = i * tpc
-        end = min((i + 1) * tpc, duration)
-        lines += [str(i + 1), f"{_fmt_srt_time(start)} --> {_fmt_srt_time(end)}", " ".join(chunk), ""]
-    return "\n".join(lines)
-
-
-@app.get("/review/{short_id}", response_class=HTMLResponse)
-async def review_page(request: Request, short_id: int):
-    rows = db_read("SELECT * FROM shorts WHERE id=?", (short_id,))
-    if not rows:
-        raise HTTPException(status_code=404, detail="Short not found.")
-    short = rows[0]
-    video_rows = db_read("SELECT * FROM videos WHERE id=?", (short["video_id"],))
-    video = video_rows[0] if video_rows else {}
-    return templates.TemplateResponse(
-        request,
-        "review.html",
-        context={"short": short, "video": video},
-    )
-
-
-@app.get("/shorts/{short_id}")
-async def get_short(short_id: int):
-    rows = db_read("SELECT * FROM shorts WHERE id=?", (short_id,))
-    if not rows:
-        raise HTTPException(status_code=404, detail="Short not found.")
-    return rows[0]
-
-
-@app.post("/shorts/{short_id}/approve")
-async def approve_short(short_id: int):
-    if not db_read("SELECT id FROM shorts WHERE id=?", (short_id,)):
-        raise HTTPException(status_code=404, detail="Short not found.")
-    db_write(
-        "UPDATE shorts SET status='approved', approved_at=datetime('now'), updated_at=datetime('now') WHERE id=?",
-        (short_id,),
-    )
-    return {"status": "approved"}
-
-
-@app.post("/shorts/{short_id}/reject")
-async def reject_short(short_id: int):
-    if not db_read("SELECT id FROM shorts WHERE id=?", (short_id,)):
-        raise HTTPException(status_code=404, detail="Short not found.")
-    db_write(
-        "UPDATE shorts SET status='rejected', updated_at=datetime('now') WHERE id=?",
-        (short_id,),
-    )
-    return {"status": "rejected"}
-
-
-class ShortUpdate(BaseModel):
-    title: Optional[str] = None
-    description: Optional[str] = None
-    caption_text: Optional[str] = None
-    start_time: Optional[float] = None
-    end_time: Optional[float] = None
-
-
-@app.patch("/shorts/{short_id}")
-async def update_short(short_id: int, body: ShortUpdate):
-    rows = db_read("SELECT * FROM shorts WHERE id=?", (short_id,))
-    if not rows:
-        raise HTTPException(status_code=404, detail="Short not found.")
-    short = rows[0]
-    fields: list[str] = []
-    values: list = []
-    if body.title is not None:
-        fields.append("title=?"); values.append(body.title[:120])
-    if body.description is not None:
-        fields.append("description=?"); values.append(body.description[:1000])
-    if body.caption_text is not None:
-        fields.append("caption_text=?"); values.append(body.caption_text[:2000])
-    if body.start_time is not None:
-        new_start = max(0.0, body.start_time)
-        fields.append("start_time=?"); values.append(new_start)
-    if body.end_time is not None:
-        fields.append("end_time=?"); values.append(body.end_time)
-    # Recalculate duration if either time changed
-    if body.start_time is not None or body.end_time is not None:
-        s = body.start_time if body.start_time is not None else (short["start_time"] or 0)
-        e = body.end_time if body.end_time is not None else (short["end_time"] or 0)
-        fields.append("duration=?"); values.append(max(1.0, e - s))
-    if not fields:
-        return short
-    fields.append("updated_at=datetime('now')")
-    values.append(short_id)
-    db_write(f"UPDATE shorts SET {', '.join(fields)} WHERE id=?", tuple(values))
-    return db_read("SELECT * FROM shorts WHERE id=?", (short_id,))[0]
-
-
-@app.get("/shorts/{short_id}/regen-status")
-async def regen_status(short_id: int):
-    rows = db_read("SELECT status, updated_at FROM shorts WHERE id=?", (short_id,))
-    if not rows:
-        raise HTTPException(status_code=404, detail="Short not found.")
-    return rows[0]
-
-
-@app.post("/shorts/{short_id}/regenerate")
-async def regenerate_short(short_id: int, background_tasks: BackgroundTasks):
-    rows = db_read("SELECT * FROM shorts WHERE id=?", (short_id,))
-    if not rows:
-        raise HTTPException(status_code=404, detail="Short not found.")
-    short = rows[0]
-    video_rows = db_read("SELECT source_path FROM videos WHERE id=?", (short["video_id"],))
-    if not video_rows:
-        raise HTTPException(status_code=404, detail="Source video not found.")
-    source_path = video_rows[0].get("source_path", "")
-    if not source_path or not Path(source_path).exists():
-        raise HTTPException(
-            status_code=400,
-            detail="Source video file not found. Please re-download or re-upload the video first.",
-        )
-    db_write(
-        "UPDATE shorts SET status='regenerating', updated_at=datetime('now') WHERE id=?",
-        (short_id,),
-    )
-    background_tasks.add_task(_do_regenerate, short_id, dict(short), source_path)
-    return {"status": "regenerating"}
-
-
-def _do_regenerate(short_id: int, short: dict, source_path: str) -> None:
-    try:
-        start = float(short.get("start_time") or 0)
-        end = float(short.get("end_time") or start + 30)
-        duration = max(1.0, end - start)
-        caption_text = (short.get("caption_text") or "").strip()
-        srt_path: Optional[str] = None
-        if caption_text:
-            srt_content = caption_text_to_srt(caption_text, duration)
-            if srt_content.strip():
-                srt_file = OUTPUTS_DIR / f"regen_{short_id}.srt"
-                srt_file.write_text(srt_content)
-                srt_path = str(srt_file)
-        out_filename = short.get("filename") or f"regen_{short_id}.mp4"
-        out_path = str(OUTPUTS_DIR / out_filename)
-        ok = export_short_clip(source_path, out_path, start, duration, srt_path)
-        if srt_path:
-            try:
-                Path(srt_path).unlink(missing_ok=True)
-            except Exception:
-                pass
-        if ok:
-            db_write(
-                "UPDATE shorts SET status='draft', duration=?, updated_at=datetime('now') WHERE id=?",
-                (duration, short_id),
-            )
-        else:
-            db_write(
-                "UPDATE shorts SET status='failed', updated_at=datetime('now') WHERE id=?",
-                (short_id,),
-            )
-    except Exception:
-        db_write(
-            "UPDATE shorts SET status='failed', updated_at=datetime('now') WHERE id=?",
-            (short_id,),
-        )
-
-
 @app.post("/webhooks/youtube")
 async def youtube_webhook(request: Request):
     body = await request.body()
@@ -1816,4 +1623,3 @@ async def youtube_webhook_verify(request: Request):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=True)
-
