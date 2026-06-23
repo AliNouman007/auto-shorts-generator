@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Review Short · Auto Shorts Studio</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css?v=8" />
+</head>
+<body>
+<header class="header">
+  <div class="header-inner">
+    <a href="/" class="logo"><div class="logo-icon">✂</div>Auto Shorts Studio</a>
+    <div class="header-status">
+      <a class="nav-link" href="/">Dashboard</a>
+      <a class="nav-link" href="/queue">Queue</a>
+      <span class="pill {{ 'ok' if youtube_connected else 'warn' }}"><span class="dot"></span>{{ 'Upload Connected' if youtube_connected else 'Upload Disconnected' }}</span>
+    </div>
+  </div>
+</header>
+
+<main class="main">
+  <div class="review-shell" data-short-id="{{ short.id }}">
+    <section class="review-preview">
+      {% if short.source_path %}
+      <div class="review-source">
+        <div class="short-meta">Source video</div>
+        <video class="review-source-video" controls playsinline preload="metadata" src="/source-video/{{ short.video_id }}"></video>
+      </div>
+      {% endif %}
+      <div class="short-meta">Generated Short</div>
+      <video class="review-video" controls playsinline preload="metadata" src="/outputs/{{ short.filename }}"></video>
+      <div class="review-actions">
+        <a href="/download/{{ short.filename }}" class="btn btn-ghost" download>Download</a>
+        {% if short.status == 'approved' %}
+        <button class="btn btn-primary" onclick="uploadShort({{ short.id }}, this)">Upload to YouTube</button>
+        {% endif %}
+      </div>
+    </section>
+
+    <section class="review-panel">
+      <div class="panel-heading">
+        <div>
+          <p class="section-title">Short Review</p>
+          <h1>{{ short.title or 'Untitled Short' }}</h1>
+        </div>
+        {% if (short.status or 'draft') not in ['approved', 'rejected'] %}
+        <span class="short-status short-status-{{ short.status or 'draft' }}">{{ short.status or 'draft' }}</span>
+        {% endif %}
+      </div>
+
+      <div class="form-grid">
+        <label class="form-field">
+          <span>Title</span>
+          <input id="review-title" value="{{ short.title or '' }}" />
+        </label>
+        <label class="form-field">
+          <span>Upload Title</span>
+          <input id="review-upload-title" value="{{ short.upload_title or short.title or '' }}" />
+        </label>
+        <label class="form-field full">
+          <span>Description</span>
+          <textarea id="review-description" rows="3">{{ short.description or '' }}</textarea>
+        </label>
+        <label class="form-field full">
+          <span>Upload Description</span>
+          <textarea id="review-upload-description" rows="3">{{ short.upload_description or short.description or '' }}</textarea>
+        </label>
+        <label class="form-field full">
+          <span>Captions</span>
+          <textarea id="review-caption" rows="6">{{ short.caption_text or '' }}</textarea>
+        </label>
+        <label class="form-field">
+          <span>Start</span>
+          <input id="review-start" type="number" step="0.1" value="{{ short.start_time or 0 }}" />
+        </label>
+        <label class="form-field">
+          <span>End</span>
+          <input id="review-end" type="number" step="0.1" value="{{ short.end_time or 0 }}" />
+        </label>
+      </div>
+
+      <div class="review-actions">
+        <button class="btn btn-primary" onclick="saveReviewShort({{ short.id }}, this)">Save</button>
+        <button class="btn btn-secondary" onclick="saveShortTiming({{ short.id }}, this)">Save Timing</button>
+        <button class="btn btn-ghost" onclick="regenerateShort({{ short.id }}, this)">Regenerate Export</button>
+      </div>
+
+      <div class="review-meta">
+        <span>Source: {{ short.source_title or short.youtube_video_id }}</span>
+        <span>{{ '%.1f'|format(short.duration or 0) }}s</span>
+        {% if short.virality_score is not none %}<span>Virality {{ short.virality_score }}%</span>{% endif %}
+        {% if short.completion_score is not none %}<span>Completion {{ short.completion_score }}%</span>{% endif %}
+      </div>
+
+      {% if short.latest_upload %}
+      <div class="upload-summary">
+        <strong>Latest upload:</strong> {{ short.latest_upload.status }}
+        {% if short.latest_upload.platform_url %}
+        · <a href="{{ short.latest_upload.platform_url }}" target="_blank" rel="noopener">Open on YouTube</a>
+        {% endif %}
+        {% if short.latest_upload.error_message %}
+        <div class="error-text">{{ short.latest_upload.error_message }}</div>
+        {% endif %}
+      </div>
+      {% endif %}
+    </section>
+  </div>
+</main>
+
+<div id="toast-area"></div>
+<script src="/static/app.js?v=12"></script>
+</body>
+</html>

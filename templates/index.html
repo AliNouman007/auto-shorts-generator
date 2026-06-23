@@ -3,10 +3,13 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
   <title>Auto Shorts Generator</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css?v=6" />
+  <link rel="stylesheet" href="/static/style.css?v=9" />
 </head>
 <body>
 
@@ -14,31 +17,42 @@
   <div class="header-inner">
     <a href="/" class="logo">
       <div class="logo-icon">✂</div>
-      Auto Shorts Generator
+      Auto Shorts Studio
     </a>
     <div class="header-status">
+      <a class="nav-link" href="/queue">Queue</a>
       {% if has_youtube_key %}
-        <span class="pill ok"><span class="dot"></span>YouTube API</span>
+        <span class="pill ok"><span class="dot"></span>API Ready</span>
       {% else %}
-        <span class="pill warn"><span class="dot"></span>YouTube API missing</span>
+        <span class="pill warn"><span class="dot"></span>API Missing</span>
       {% endif %}
+      <span class="pill {% if youtube_connected %}ok{% elif has_youtube_oauth %}warn{% else %}error{% endif %}" data-yt-status="true">
+        <span class="dot"></span>
+        {% if youtube_connected %}
+          Upload Connected
+        {% elif has_youtube_oauth %}
+          Upload Disconnected
+        {% else %}
+          Upload Setup
+        {% endif %}
+      </span>
       {% if ai_model == 'groq' %}
         {% if has_groq_key %}
-          <span class="pill ok"><span class="dot"></span>Groq</span>
+          <span class="pill ok"><span class="dot"></span>AI Groq</span>
         {% else %}
-          <span class="pill error"><span class="dot"></span>Groq key missing</span>
+          <span class="pill error"><span class="dot"></span>AI Missing</span>
         {% endif %}
       {% elif ai_model == 'gemini' %}
         {% if has_gemini_key %}
-          <span class="pill ok"><span class="dot"></span>Gemini</span>
+          <span class="pill ok"><span class="dot"></span>AI Gemini</span>
         {% else %}
-          <span class="pill error"><span class="dot"></span>Gemini key missing</span>
+          <span class="pill error"><span class="dot"></span>AI Missing</span>
         {% endif %}
       {% else %}
         {% if has_openai_key %}
-          <span class="pill ok"><span class="dot"></span>OpenAI</span>
+          <span class="pill ok"><span class="dot"></span>AI OpenAI</span>
         {% else %}
-          <span class="pill warn"><span class="dot"></span>OpenAI optional</span>
+          <span class="pill warn"><span class="dot"></span>AI Optional</span>
         {% endif %}
       {% endif %}
     </div>
@@ -46,9 +60,11 @@
 </header>
 
 <main class="main">
+  {% set output_preset = default_preset if default_preset is defined else none %}
+  {% set output_config = output_preset.config if output_preset else {} %}
 
   <!-- ===================== SETTINGS PANEL ===================== -->
-  <div class="settings-card" id="settings-panel">
+  <div class="settings-card" id="settings-panel" data-default-preset-id="{{ output_preset.id if output_preset else '' }}">
     <div class="settings-header" onclick="toggleSettings()">
       <div style="display:flex;align-items:center;gap:0.6rem">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M4.93 4.93a10 10 0 0 0 0 14.14"/></svg>
@@ -107,6 +123,60 @@
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
           Preview Channel
         </button>
+        <button class="{% if youtube_connected %}btn btn-secondary btn-sm{% else %}btn btn-primary btn-sm{% endif %}" onclick="connectYouTube()" {% if youtube_connected %}disabled{% endif %}>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22.54 6.42a2.78 2.78 0 0 0-1.95-1.95C18.88 4 12 4 12 4s-6.88 0-8.59.47A2.78 2.78 0 0 0 1.46 6.42 29 29 0 0 0 1 12a29 29 0 0 0 .46 5.58 2.78 2.78 0 0 0 1.95 1.95C5.12 20 12 20 12 20s6.88 0 8.59-.47a2.78 2.78 0 0 0 1.95-1.95A29 29 0 0 0 23 12a29 29 0 0 0-.46-5.58z"/><polygon points="9.75 15.02 15.5 12 9.75 8.98 9.75 15.02"/></svg>
+          {% if youtube_connected %}Connected{% else %}Connect YouTube{% endif %}
+        </button>
+      </div>
+
+      <div class="settings-subsection">
+        <div class="settings-subsection-header">
+          <div>
+            <div class="settings-title">Output Preset</div>
+            <div class="field-hint">Default export settings for new Shorts and single-Short regeneration.</div>
+          </div>
+          <span class="channel-id-badge">{{ output_preset.name if output_preset else 'Default' }}</span>
+        </div>
+        <div class="preset-grid">
+          <label class="settings-field checkbox-field">
+            <span class="field-label">Captions</span>
+            <input id="preset-captions-enabled" type="checkbox" {% if output_config.captions_enabled is not defined or output_config.captions_enabled %}checked{% endif %} />
+          </label>
+          <label class="settings-field">
+            <span class="field-label">Caption Font</span>
+            <input id="preset-font-size" class="field-input" type="number" min="6" max="48" value="{{ output_config.caption_font_size | default(10) }}" />
+          </label>
+          <label class="settings-field">
+            <span class="field-label">Caption Margin</span>
+            <input id="preset-margin-v" class="field-input" type="number" min="0" max="240" value="{{ output_config.caption_margin_v | default(40) }}" />
+          </label>
+          <label class="settings-field">
+            <span class="field-label">Resolution</span>
+            <select id="preset-resolution" class="field-input">
+              <option value="1080x1920" {% if output_config.width is not defined or output_config.width == 1080 %}selected{% endif %}>1080x1920</option>
+              <option value="720x1280" {% if output_config.width == 720 %}selected{% endif %}>720x1280</option>
+            </select>
+          </label>
+          <label class="settings-field">
+            <span class="field-label">Encoder Preset</span>
+            <select id="preset-encoder" class="field-input">
+              {% for encoder in ['ultrafast','superfast','veryfast','faster','fast','medium'] %}
+              <option value="{{ encoder }}" {% if (output_config.encoder_preset | default('veryfast')) == encoder %}selected{% endif %}>{{ encoder }}</option>
+              {% endfor %}
+            </select>
+          </label>
+          <label class="settings-field">
+            <span class="field-label">CRF</span>
+            <input id="preset-crf" class="field-input" type="number" min="16" max="40" value="{{ output_config.crf | default(24) }}" />
+          </label>
+          <label class="settings-field">
+            <span class="field-label">Blur Strength</span>
+            <input id="preset-blur" class="field-input" type="number" min="0" max="80" value="{{ output_config.blur_strength | default(30) }}" />
+          </label>
+        </div>
+        <div class="settings-actions">
+          <button class="btn btn-primary btn-sm" onclick="saveDefaultPreset(this)">Save Output Preset</button>
+        </div>
       </div>
     </div>
   </div>
@@ -158,6 +228,17 @@
             {% if video.status in ('processing', 'downloading') %}<span class="spin" style="border-top-color:var(--accent)"></span>{% endif %}
             {{ video.status }}
           </span>
+
+          <label class="caption-toggle" for="captions-toggle-{{ video.id }}">
+            <input
+              type="checkbox"
+              id="captions-toggle-{{ video.id }}"
+              checked
+              {% if video.status in ('processing','downloading') %}disabled{% endif %}
+            />
+            <span class="caption-toggle-ui" aria-hidden="true"></span>
+            <span>Captions</span>
+          </label>
 
           {% if video.status == 'detected' or (video.status == 'failed' and not video.source_path) %}
           <button class="btn btn-primary btn-sm" id="dl-btn-{{ video.id }}" onclick="downloadAndProcess({{ video.id }}, this)">
@@ -223,7 +304,15 @@
         <div class="shorts-label" id="shorts-label-{{ video.id }}">{{ video.shorts|length }} Short{{ 's' if video.shorts|length != 1 }} Generated</div>
         <div class="shorts-grid" id="shorts-grid-{{ video.id }}">
           {% for short in video.shorts %}
-          <div class="short-card" data-short-id="{{ short.id }}">
+          <div class="short-card short-card-{{ short.status or 'draft' }}" data-short-id="{{ short.id }}">
+            <div class="short-card-top">
+              {% if (short.status or 'draft') not in ['approved', 'rejected'] %}
+              <span class="short-status short-status-{{ short.status or 'draft' }}">{{ short.status or 'draft' }}</span>
+              {% endif %}
+              {% if short.latest_upload and short.latest_upload.status %}
+              <span class="short-status short-status-{{ short.latest_upload.status }}">{{ short.latest_upload.status }}</span>
+              {% endif %}
+            </div>
             {% if short.title %}
             <div class="short-title">{{ short.title }}</div>
             {% endif %}
@@ -253,6 +342,12 @@
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 3 20 12 6 21 6 3"/></svg>
                 Play
               </button>
+              <a href="/short/{{ short.id }}/review" class="btn btn-secondary btn-sm" style="text-decoration:none">Review</a>
+              <button class="btn btn-secondary btn-sm" onclick="updateShortStatus({{ short.id }}, 'approved', this)">Approve</button>
+              <button class="btn btn-danger btn-sm" onclick="updateShortStatus({{ short.id }}, 'rejected', this)">Reject</button>
+              {% if (short.status or 'draft') == 'approved' %}
+              <button class="btn btn-ghost btn-sm" onclick="uploadShort({{ short.id }}, this)">Upload</button>
+              {% endif %}
               <a href="/download/{{ short.filename }}" class="btn btn-ghost btn-sm" style="text-decoration:none" download>
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
                 Download
@@ -284,7 +379,36 @@
   </div>
 </div>
 
+<div class="short-player-modal" id="oauth-modal" aria-hidden="true" role="dialog" aria-modal="true">
+  <div class="short-player-backdrop" onclick="closeOAuthModal()"></div>
+  <div class="short-player-dialog" style="max-width:440px">
+    <div class="short-player-header">
+      <div>
+        <div class="short-player-title">YouTube OAuth Credentials</div>
+        <div class="short-player-filename">Enter your Google Cloud OAuth credentials to connect YouTube.</div>
+      </div>
+      <button class="btn btn-secondary btn-sm" onclick="closeOAuthModal()" aria-label="Close">Close</button>
+    </div>
+    <div style="padding:1rem 1.25rem;display:flex;flex-direction:column;gap:0.75rem">
+      <label class="settings-field">
+        <span class="field-label">Client ID</span>
+        <input id="oauth-client-id" class="field-input" type="text" placeholder="xxxxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com" />
+      </label>
+      <label class="settings-field">
+        <span class="field-label">Client Secret</span>
+        <input id="oauth-client-secret" class="field-input" type="text" placeholder="GOCSPX-xxxxxxxxxxxxxxxxxxxx" />
+      </label>
+      <label class="settings-field">
+        <span class="field-label">Redirect URI</span>
+        <input id="oauth-redirect-uri" class="field-input" type="text" placeholder="http://localhost:8000/youtube/callback" />
+      </label>
+      <div class="field-hint">Create a project at <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener">Google Cloud Console</a>, enable the YouTube Data API v3, and add an OAuth 2.0 Client ID credential with the Redirect URI above.</div>
+      <button class="btn btn-primary" onclick="saveOAuthSettings()" style="align-self:flex-end">Save &amp; Connect</button>
+    </div>
+  </div>
+</div>
+
 <div id="toast-area"></div>
-<script src="/static/app.js?v=6"></script>
+<script src="/static/app.js?v=12"></script>
 </body>
 </html>

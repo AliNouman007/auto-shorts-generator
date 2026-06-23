@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 from starlette.requests import Request
 
@@ -14,6 +15,146 @@ class ExportFilterTest(unittest.TestCase):
         self.assertIn("scale=1080:1920:force_original_aspect_ratio=decrease", vf)
         self.assertIn("overlay=(W-w)/2:(H-h)/2", vf)
         self.assertNotIn("crop=ih*9/16", vf)
+
+    def test_subtitle_burn_in_uses_10_point_captions(self):
+        srt_path = main.OUTPUTS_DIR / "unit_caption_style.srt"
+        srt_path.write_text("caption")
+        self.addCleanup(lambda: srt_path.unlink(missing_ok=True))
+
+        vf = main.build_export_video_filter(str(srt_path), {
+            "caption_font_size": 10,
+            "encoder_preset": "veryfast",
+        })
+
+        self.assertIn("FontSize=10", vf)
+        self.assertNotIn("FontSize=12", vf)
+
+    def test_export_short_clip_uses_faster_x264_settings(self):
+        with mock.patch.object(main, "run_command") as run_command:
+            run_command.return_value.returncode = 0
+
+            exported = main.export_short_clip(
+                "source.mp4",
+                "short.mp4",
+                0,
+                30,
+                preset={"encoder_preset": "veryfast", "crf": 24},
+            )
+
+        self.assertTrue(exported)
+        command = run_command.call_args.args[0]
+        self.assertIn("libx264", command)
+        self.assertEqual("veryfast", command[command.index("-preset") + 1])
+        self.assertEqual("24", command[command.index("-crf") + 1])
+
+
+class CaptionTranscriptionTest(unittest.TestCase):
+    def test_local_whisper_transcribes_without_forcing_language_or_translation(self):
+        with mock.patch.object(main, "run_command") as run_command:
+            run_command.return_value.returncode = 1
+
+            main.transcribe_with_whisper_local("unit_audio.mp3")
+
+        command = run_command.call_args.args[0]
+        self.assertIn("--task", command)
+        self.assertIn("transcribe", command)
+        self.assertNotIn("translate", command)
+        self.assertNotIn("--language", command)
+
+    def test_api_transcription_data_does_not_force_language_or_romanization(self):
+        data = main.build_whisper_transcription_data("whisper-1")
+
+        self.assertEqual("whisper-1", data["model"])
+        self.assertEqual("verbose_json", data["response_format"])
+        self.assertNotIn("language", data)
+        self.assertNotIn("prompt", data)
+
+    def test_gemini_prompt_requests_accurate_transcription_without_translation(self):
+        prompt = main.build_gemini_transcription_prompt()
+
+        self.assertIn("Transcribe", prompt)
+        self.assertIn("preserve the speaker's original words", prompt)
+        self.assertIn("Do not translate", prompt)
+        self.assertNotIn("Roman English", prompt)
+
+
+class CaptionFormattingTest(unittest.TestCase):
+    def test_srt_wraps_long_caption_into_blocks_with_at_most_three_lines(self):
+        segments = [{
+            "start": 0,
+            "end": 9,
+            "text": (
+                "This is a very long caption sentence that should be split into smaller "
+                "subtitle blocks so it never covers the full video screen."
+            ),
+        }]
+
+        srt = main.generate_srt(segments, 0, 9)
+
+        entries = [entry.splitlines() for entry in srt.split("\n\n")]
+        self.assertGreater(len(entries), 1)
+        for entry in entries:
+            caption_lines = entry[2:]
+            self.assertLessEqual(len(caption_lines), 3)
+            self.assertTrue(all(len(line) <= 32 for line in caption_lines))
+
+    def test_caption_request_body_defaults_to_enabled(self):
+        self.assertTrue(main.captions_enabled_from_body({}))
+        self.assertTrue(main.captions_enabled_from_body({"captions_enabled": True}))
+        self.assertFalse(main.captions_enabled_from_body({"captions_enabled": False}))
+
+    def test_srt_preserves_transcribed_script_before_wrapping(self):
+        segments = [
+            {"start": 0, "end": 2, "text": "तुम कैसे हो"},
+            {"start": 2, "end": 4, "text": "تم کیسے ہو"},
+        ]
+
+        srt = main.generate_srt(segments, 0, 4)
+
+        self.assertIn("तुम कैसे हो", srt)
+        self.assertIn("تم کیسے ہو", srt)
+
+
+class ProcessingCaptionToggleTest(unittest.TestCase):
+    def test_processing_with_captions_disabled_exports_without_srt_file(self):
+        source_path = main.UPLOADS_DIR / "unit_no_captions.mp4"
+        source_path.write_text("source")
+        main.db_write(
+            "INSERT INTO videos (youtube_video_id, title, source_path, status) VALUES (?,?,?,'waiting')",
+            ("unit_no_captions", "No captions", str(source_path)),
+        )
+        video_id = main.db_read(
+            "SELECT id FROM videos WHERE youtube_video_id=?",
+            ("unit_no_captions",),
+        )[0]["id"]
+        self.addCleanup(lambda: main.db_write("DELETE FROM shorts WHERE video_id=?", (video_id,)))
+        self.addCleanup(lambda: main.db_write("DELETE FROM videos WHERE id=?", (video_id,)))
+        self.addCleanup(lambda: source_path.unlink(missing_ok=True))
+        self.addCleanup(lambda: (main.OUTPUTS_DIR / "unit_no_captions_short_01.srt").unlink(missing_ok=True))
+
+        clip = {
+            "start": 0,
+            "end": 10,
+            "text": "This transcript should not be burned in.",
+            "title": "No caption export",
+            "virality_score": 70,
+            "completion_score": 80,
+            "hook_type": "useful",
+            "reason": "Test clip.",
+        }
+        with (
+            mock.patch.object(main, "missing_tools_message", return_value=""),
+            mock.patch.object(main, "is_valid_video", return_value=True),
+            mock.patch.object(main, "get_video_duration", return_value=30),
+            mock.patch.object(main, "extract_audio", return_value=True),
+            mock.patch.object(main, "transcribe_with_whisper_local", return_value=[clip]),
+            mock.patch.object(main, "select_clips_for_video", return_value=[clip]),
+            mock.patch.object(main, "export_short_clip", return_value=True) as export_short_clip,
+        ):
+            main._process_video_sync(video_id, str(source_path), captions_enabled=False)
+
+        self.assertIsNone(export_short_clip.call_args.args[4])
+        self.assertFalse((main.OUTPUTS_DIR / "unit_no_captions_short_01.srt").exists())
 
 
 class ClipSelectionTest(unittest.TestCase):
@@ -206,7 +347,44 @@ class DashboardRenderingTest(unittest.TestCase):
         self.assertIn("Generate Shorts", html)
         self.assertIn("Upload File", html)
         self.assertIn("Delete Video", html)
+        self.assertIn('id="captions-toggle-1"', html)
+        self.assertIn("Captions", html)
         self.assertNotIn("Download &amp; Generate", html)
+
+    def test_dashboard_header_uses_clear_status_labels(self):
+        request = Request({
+            "type": "http",
+            "method": "GET",
+            "path": "/",
+            "headers": [],
+        })
+        response = main.templates.TemplateResponse(
+            request,
+            "index.html",
+            context={
+                "videos": [],
+                "channel_id": "test",
+                "ai_model": "groq",
+                "has_youtube_key": True,
+                "has_openai_key": False,
+                "has_gemini_key": False,
+                "has_groq_key": True,
+                "youtube_connected": True,
+                "has_youtube_oauth": True,
+            },
+        )
+        html = response.body.decode()
+
+        self.assertIn("API Ready", html)
+        self.assertIn("Upload Connected", html)
+        self.assertIn("AI Groq", html)
+        self.assertNotIn("YouTube:", html)
+        self.assertNotIn("YouTube API", html)
+
+    def test_frontend_does_not_poll_youtube_status(self):
+        js = (main.STATIC_DIR / "app.js").read_text()
+
+        self.assertNotIn("/youtube/status", js)
 
     def test_generated_short_renders_play_button_and_video_modal(self):
         request = Request({
@@ -297,6 +475,250 @@ class DashboardRenderingTest(unittest.TestCase):
 
         self.assertIn('id="shorts-section-1"', html)
         self.assertIn('id="shorts-grid-1"', html)
+
+    def test_queue_row_renders_delete_short_action(self):
+        request = Request({
+            "type": "http",
+            "method": "GET",
+            "path": "/queue",
+            "headers": [],
+        })
+        response = main.templates.TemplateResponse(
+            request,
+            "queue.html",
+            context={
+                "queue": [{
+                    "short_id": 44,
+                    "upload_title": "Ready Short",
+                    "title": "Ready Short",
+                    "source_title": "Source video",
+                    "duration": 21,
+                    "short_status": "approved",
+                    "upload_status": "",
+                    "upload_id": None,
+                    "platform_url": "",
+                    "error_message": "",
+                }],
+                "status_filter": "all",
+                "youtube_connected": False,
+                "has_youtube_oauth": False,
+            },
+        )
+        html = response.body.decode()
+
+        self.assertIn('aria-label="Delete Short from queue"', html)
+        self.assertIn("deleteShort(44, this)", html)
+        self.assertNotIn("short-status-approved", html)
+
+    def test_review_page_does_not_render_approve_reject_controls_or_marks(self):
+        request = Request({
+            "type": "http",
+            "method": "GET",
+            "path": "/short/44/review",
+            "headers": [],
+        })
+        response = main.templates.TemplateResponse(
+            request,
+            "review.html",
+            context={
+                "short": {
+                    "id": 44,
+                    "video_id": 2,
+                    "filename": "ready_short.mp4",
+                    "source_path": "",
+                    "title": "Ready Short",
+                    "upload_title": "Ready Short",
+                    "description": "",
+                    "upload_description": "",
+                    "caption_text": "",
+                    "start_time": 0,
+                    "end_time": 21,
+                    "duration": 21,
+                    "status": "approved",
+                    "source_title": "Source video",
+                    "youtube_video_id": "source123",
+                    "virality_score": None,
+                    "completion_score": None,
+                    "latest_upload": None,
+                },
+                "youtube_connected": False,
+            },
+        )
+        html = response.body.decode()
+
+        self.assertNotIn(">Approve<", html)
+        self.assertNotIn(">Reject<", html)
+        self.assertNotIn("short-status-approved", html)
+
+
+class StudioWorkflowTest(unittest.TestCase):
+    def setUp(self):
+        self.video_id = None
+        self.short_id = None
+        self.source_path = main.UPLOADS_DIR / "studio_workflow_source.mp4"
+        self.source_path.write_text("source")
+        existing = main.db_read(
+            "SELECT id FROM videos WHERE youtube_video_id=?",
+            ("studio_workflow_video",),
+        )
+        for row in existing:
+            main.db_write("DELETE FROM short_analytics WHERE upload_id IN (SELECT id FROM short_uploads WHERE short_id IN (SELECT id FROM shorts WHERE video_id=?))", (row["id"],))
+            main.db_write("DELETE FROM short_uploads WHERE short_id IN (SELECT id FROM shorts WHERE video_id=?)", (row["id"],))
+            main.db_write("DELETE FROM shorts WHERE video_id=?", (row["id"],))
+            main.db_write("DELETE FROM videos WHERE id=?", (row["id"],))
+        main.db_write(
+            "INSERT INTO videos (youtube_video_id, title, source_path, status) VALUES (?,?,?,'completed')",
+            ("studio_workflow_video", "Studio workflow", str(self.source_path)),
+        )
+        self.video_id = main.db_read(
+            "SELECT id FROM videos WHERE youtube_video_id=?",
+            ("studio_workflow_video",),
+        )[0]["id"]
+        main.db_write(
+            "INSERT INTO shorts "
+            "(video_id, filename, start_time, end_time, duration, caption_text, title, description, "
+            "status, original_start_time, original_end_time, upload_title, upload_description) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                self.video_id,
+                "studio_workflow_short_01.mp4",
+                0,
+                15,
+                15,
+                "Original caption",
+                "Original title",
+                "",
+                "draft",
+                0,
+                15,
+                "Original title",
+                "",
+            ),
+        )
+        self.short_id = main.db_read(
+            "SELECT id FROM shorts WHERE filename=?",
+            ("studio_workflow_short_01.mp4",),
+        )[0]["id"]
+        (main.OUTPUTS_DIR / "studio_workflow_short_01.mp4").write_text("short")
+
+    def tearDown(self):
+        if self.short_id:
+            main.db_write("DELETE FROM short_analytics WHERE upload_id IN (SELECT id FROM short_uploads WHERE short_id=?)", (self.short_id,))
+            main.db_write("DELETE FROM short_uploads WHERE short_id=?", (self.short_id,))
+            main.db_write("DELETE FROM shorts WHERE id=?", (self.short_id,))
+        if self.video_id:
+            main.db_write("DELETE FROM videos WHERE id=?", (self.video_id,))
+        self.source_path.unlink(missing_ok=True)
+        (main.OUTPUTS_DIR / "studio_workflow_short_01.mp4").unlink(missing_ok=True)
+        (main.OUTPUTS_DIR / "studio_workflow_short_01.srt").unlink(missing_ok=True)
+
+    def test_export_filter_accepts_explicit_preset_config(self):
+        preset = {
+            "caption_font_size": 10,
+            "width": 1080,
+            "height": 1920,
+        }
+
+        srt_path = main.OUTPUTS_DIR / "studio_workflow_short_01.srt"
+        srt_path.write_text("caption")
+
+        vf = main.build_export_video_filter(str(srt_path), preset)
+
+        self.assertIn("scale=1080:1920", vf)
+        self.assertIn("FontSize=10", vf)
+
+    def test_short_metadata_status_and_timing_helpers(self):
+        main.update_short_metadata(
+            self.short_id,
+            {
+                "title": "Edited title",
+                "description": "Edited description",
+                "caption_text": "Edited caption",
+                "upload_title": "Upload title",
+                "upload_description": "Upload description",
+            },
+        )
+        main.update_short_status(self.short_id, "approved")
+        main.update_short_timing(self.short_id, 2, 14)
+
+        short = main.get_short_detail(self.short_id)
+
+        self.assertEqual("Edited title", short["title"])
+        self.assertEqual("Edited caption", short["caption_text"])
+        self.assertEqual("approved", short["status"])
+        self.assertEqual(2, short["start_time"])
+        self.assertEqual(14, short["end_time"])
+        self.assertEqual(0, short["original_start_time"])
+        self.assertEqual(15, short["original_end_time"])
+
+    def test_invalid_short_timing_is_rejected(self):
+        with self.assertRaises(ValueError):
+            main.update_short_timing(self.short_id, 20, 10)
+
+    def test_regenerate_short_uses_edited_caption_and_timing(self):
+        main.update_short_metadata(self.short_id, {"caption_text": "Edited caption for export"})
+        main.update_short_timing(self.short_id, 3, 12)
+
+        with mock.patch.object(main, "export_short_clip", return_value=True) as export_short_clip:
+            regenerated = main.regenerate_short(self.short_id)
+
+        self.assertEqual(self.short_id, regenerated["id"])
+        self.assertEqual(9, regenerated["duration"])
+        self.assertEqual(3, export_short_clip.call_args.args[2])
+        self.assertEqual(9, export_short_clip.call_args.args[3])
+        srt_path = export_short_clip.call_args.args[4]
+        self.assertTrue(srt_path.endswith(".srt"))
+        self.assertIn("Edited caption for export", (main.OUTPUTS_DIR / "studio_workflow_short_01.srt").read_text())
+
+    def test_upload_requires_approved_short_and_records_success(self):
+        with self.assertRaises(ValueError):
+            main.create_youtube_upload(self.short_id)
+
+        main.update_short_status(self.short_id, "approved")
+        with mock.patch.object(main.youtube_upload, "upload_short_to_youtube") as upload:
+            upload.return_value = {
+                "platform_video_id": "yt123",
+                "platform_url": "https://youtube.com/shorts/yt123",
+            }
+            upload_row = main.create_youtube_upload(self.short_id)
+
+        self.assertEqual("uploaded", upload_row["status"])
+        self.assertEqual("yt123", upload_row["platform_video_id"])
+        self.assertEqual("https://youtube.com/shorts/yt123", upload_row["platform_url"])
+
+    def test_upload_failure_is_retryable(self):
+        main.update_short_status(self.short_id, "approved")
+        with mock.patch.object(main.youtube_upload, "upload_short_to_youtube", side_effect=RuntimeError("token missing")):
+            upload_row = main.create_youtube_upload(self.short_id)
+
+        self.assertEqual("failed", upload_row["status"])
+        self.assertIn("token missing", upload_row["error_message"])
+
+        with mock.patch.object(main.youtube_upload, "upload_short_to_youtube") as upload:
+            upload.return_value = {"platform_video_id": "retry123", "platform_url": "https://youtube.com/shorts/retry123"}
+            retried = main.retry_upload(upload_row["id"])
+
+        self.assertEqual("uploaded", retried["status"])
+        self.assertEqual("retry123", retried["platform_video_id"])
+
+    def test_queue_and_analytics_helpers(self):
+        main.update_short_status(self.short_id, "approved")
+        main.db_write(
+            "INSERT INTO short_uploads (short_id, platform, status, platform_video_id, platform_url) VALUES (?,?,?,?,?)",
+            (self.short_id, "youtube", "uploaded", "analytics123", "https://youtube.com/shorts/analytics123"),
+        )
+        upload_id = main.db_read("SELECT id FROM short_uploads WHERE short_id=?", (self.short_id,))[0]["id"]
+
+        queue = main.get_upload_queue("all")
+        self.assertTrue(any(row["short_id"] == self.short_id for row in queue))
+
+        with mock.patch.object(main.youtube_upload, "fetch_youtube_analytics") as analytics:
+            analytics.return_value = {"views": 100, "likes": 9, "comments": 2, "watch_time": 0}
+            refreshed = main.refresh_upload_analytics()
+
+        self.assertGreaterEqual(refreshed, 1)
+        stored = main.db_read("SELECT * FROM short_analytics WHERE upload_id=?", (upload_id,))
+        self.assertEqual(100, stored[-1]["views"])
 
 
 if __name__ == "__main__":
