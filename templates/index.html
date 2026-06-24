@@ -296,11 +296,29 @@
       <!-- Steps progress (shown live during processing/downloading) -->
       <div class="steps-panel" id="steps-{{ video.id }}" style="display:{% if video.status in ('processing','downloading') %}block{% else %}none{% endif %}">
         <div class="steps-list" id="steps-list-{{ video.id }}">
-          {% if video.steps_json %}
-            {% set steps = video.steps_json | tojson | safe %}
+          {% if video.steps is defined and video.steps %}
+            {% for step in video.steps %}
+            <div class="step-item step-{{ step.status or 'pending' }}">
+              <span class="step-icon step-{{ step.status or 'pending' }}">{{ '✓' if step.status == 'done' else '✕' if step.status == 'error' else '·' }}</span>
+              <span class="step-name">{{ step.name }}</span>
+              {% if step.detail %}<span class="step-detail">{{ step.detail }}</span>{% endif %}
+            </div>
+            {% endfor %}
           {% endif %}
         </div>
       </div>
+      {% if video.steps is defined and video.steps %}
+      <details class="engine-log">
+        <summary>Processing Log</summary>
+        <pre>{% for step in video.steps %}[{{ step.status or 'pending' }}] {{ step.name }}{% if step.detail %}: {{ step.detail }}{% endif %}
+{% endfor %}</pre>
+      </details>
+      {% elif video.steps_json %}
+      <details class="engine-log">
+        <summary>Processing Log</summary>
+        <pre>{{ video.steps_json }}</pre>
+      </details>
+      {% endif %}
 
       <!-- Upload zone -->
       <div class="upload-zone" id="upload-zone-{{ video.id }}" style="display:none">
@@ -332,7 +350,9 @@
               {% if short.duration %}{{ '%.1f'|format(short.duration) }}s{% endif %}
               {% if short.start_time is not none %} · {{ '%.0f'|format(short.start_time) }}s–{{ '%.0f'|format(short.end_time) }}s{% endif %}
             </div>
-            {% if short.virality_score is not none or short.completion_score is not none %}
+            {% set engine_label = short.timestamp_engine if (short.timestamp_engine is defined and short.timestamp_engine) else 'legacy' %}
+            {% set has_v2_score = short.timestamp_engine is defined and short.timestamp_engine and short.final_score is defined and short.final_score is not none and short.final_score > 0 %}
+            {% if short.virality_score is not none or short.completion_score is not none or engine_label or (short.candidate_source is defined and short.candidate_source) or has_v2_score %}
             <div class="short-score-row">
               {% if short.virality_score is not none %}
               <span class="score-pill score-viral">Virality {{ short.virality_score }}%</span>
@@ -343,10 +363,23 @@
               {% if short.hook_type %}
               <span class="score-pill">{{ short.hook_type }}</span>
               {% endif %}
+              <span class="score-pill">Engine {{ engine_label }}</span>
+              {% if short.candidate_source is defined and short.candidate_source %}
+              <span class="score-pill">Source {{ short.candidate_source }}</span>
+              {% endif %}
+              {% if has_v2_score %}
+              <span class="score-pill">Score {{ (short.final_score * 100)|round|int }}%</span>
+              {% endif %}
             </div>
             {% endif %}
             {% if short.selection_reason %}
             <div class="short-reason">{{ short.selection_reason }}</div>
+            {% endif %}
+            {% if short.score_details_json is defined and short.score_details_json %}
+            <details class="engine-log engine-log-short">
+              <summary>V2 Engine Log</summary>
+              <pre>{{ short.score_details_json }}</pre>
+            </details>
             {% endif %}
             <div style="display:flex;gap:0.4rem;flex-wrap:wrap;margin-top:0.25rem">
               <button class="btn btn-primary btn-sm" onclick='openShortPlayer({{ short.filename|tojson }})'>

@@ -88,11 +88,24 @@
       </div>
 
       <div class="review-meta">
+        {% set engine_label = short.timestamp_engine if (short.timestamp_engine is defined and short.timestamp_engine) else 'legacy' %}
+        {% set has_v2_score = short.timestamp_engine is defined and short.timestamp_engine and short.final_score is defined and short.final_score is not none and short.final_score > 0 %}
         <span>Source: {{ short.source_title or short.youtube_video_id }}</span>
         <span>{{ '%.1f'|format(short.duration or 0) }}s</span>
         {% if short.virality_score is not none %}<span>Virality {{ short.virality_score }}%</span>{% endif %}
         {% if short.completion_score is not none %}<span>Completion {{ short.completion_score }}%</span>{% endif %}
+        <span>Engine {{ engine_label }}</span>
+        {% if short.candidate_source is defined and short.candidate_source %}<span>Source {{ short.candidate_source }}</span>{% endif %}
+        {% if has_v2_score %}<span>Score {{ (short.final_score * 100)|round|int }}%</span>{% endif %}
+        {% if short.judge_status is defined and short.judge_status %}<span>Judge {{ short.judge_status }}</span>{% endif %}
       </div>
+
+      {% if short.score_details_json is defined and short.score_details_json %}
+      <details class="engine-log">
+        <summary>V2 Engine Log</summary>
+        <pre>{{ short.score_details_json }}</pre>
+      </details>
+      {% endif %}
 
       {% if short.latest_upload %}
       <div class="upload-summary">

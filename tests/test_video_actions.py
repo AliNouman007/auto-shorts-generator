@@ -300,6 +300,51 @@ class ProcessingCaptionToggleTest(unittest.TestCase):
         self.assertIsNone(export_short_clip.call_args.args[4])
         self.assertFalse((main.OUTPUTS_DIR / "unit_no_captions_short_01.srt").exists())
 
+    def test_processing_writes_unicode_srt_as_utf8(self):
+        source_path = main.UPLOADS_DIR / "unit_unicode_captions.mp4"
+        source_path.write_text("source")
+        main.db_write(
+            "INSERT INTO videos (youtube_video_id, title, source_path, status) VALUES (?,?,?,'waiting')",
+            ("unit_unicode_captions", "Unicode captions", str(source_path)),
+        )
+        video_id = main.db_read(
+            "SELECT id FROM videos WHERE youtube_video_id=?",
+            ("unit_unicode_captions",),
+        )[0]["id"]
+        srt_path = main.OUTPUTS_DIR / "unit_unicode_captions_short_01.srt"
+        self.addCleanup(lambda: main.db_write("DELETE FROM shorts WHERE video_id=?", (video_id,)))
+        self.addCleanup(lambda: main.db_write("DELETE FROM videos WHERE id=?", (video_id,)))
+        self.addCleanup(lambda: source_path.unlink(missing_ok=True))
+        self.addCleanup(lambda: srt_path.unlink(missing_ok=True))
+
+        clip = {
+            "start": 0,
+            "end": 12,
+            "text": "यह punchline 😂 audience ko hasa deti hai.",
+            "title": "Unicode clip",
+            "virality_score": 80,
+            "completion_score": 90,
+            "hook_type": "comedy",
+            "selection_reason": "Unicode caption test.",
+            "timestamp_engine": "v2",
+            "candidate_source": "comedy",
+            "final_score": 0.8,
+            "score_details_json": "{}",
+            "judge_status": "deterministic_fill",
+        }
+        with (
+            mock.patch.object(main, "missing_tools_message", return_value=""),
+            mock.patch.object(main, "is_valid_video", return_value=True),
+            mock.patch.object(main, "get_video_duration", return_value=120),
+            mock.patch.object(main, "extract_audio", return_value=True),
+            mock.patch.object(main, "transcribe_with_whisper_local", return_value=[clip]),
+            mock.patch.object(main, "select_clips_for_video", return_value=[clip]),
+            mock.patch.object(main, "export_short_clip", return_value=True),
+        ):
+            main._process_video_sync(video_id, str(source_path), captions_enabled=True)
+
+        self.assertIn("😂", srt_path.read_text(encoding="utf-8"))
+
     def test_processing_stores_director_upload_metadata(self):
         source_path = main.UPLOADS_DIR / "unit_director_metadata.mp4"
         source_path.write_text("source")
@@ -351,6 +396,344 @@ class ProcessingCaptionToggleTest(unittest.TestCase):
 
 
 class ClipSelectionTest(unittest.TestCase):
+    def test_v2_pipeline_scores_snaps_dedupes_and_requires_llm_judge(self):
+        from services.clip_director.selection import select_dynamic_clips
+
+        segments = [
+            {"start": 8, "end": 22, "text": "Why does this mistake ruin shorts?"},
+            {"start": 22.4, "end": 42, "text": "Because the setup hides the payoff and viewers leave."},
+            {"start": 42.2, "end": 59, "text": "Here is the fix that creates a strong reveal and payoff."},
+            {"start": 90, "end": 112, "text": "Another weaker topic starts without much value."},
+        ]
+
+        def fake_judge(episode_map, constraints, ai_model):
+            candidates = episode_map["shortlisted_candidates"]
+            return [{
+                "candidate_id": candidates[0]["candidate_id"],
+                "rank": 1,
+                "start": candidates[0]["start"] + 1.0,
+                "end": candidates[0]["end"] - 1.0,
+                "title": "Fix The Retention Mistake",
+                "reason": "Best hook and payoff.",
+            }]
+
+        clips = select_dynamic_clips(
+            segments,
+            duration=140,
+            audio_peaks=[{"start": 38, "end": 41, "peak_time": 39, "energy": 0.95}],
+            ai_model="openai",
+            mode="shorts",
+            llm_selector=fake_judge,
+            allow_fallback=False,
+            use_v2=True,
+        )
+
+        self.assertEqual(1, len(clips))
+        self.assertEqual("v2", clips[0]["timestamp_engine"])
+        self.assertIn(clips[0]["candidate_source"], {"audio_peak", "transcript_hook", "qa", "quote_value"})
+        self.assertGreater(clips[0]["final_score"], 0.5)
+        self.assertEqual("accepted", clips[0]["judge_status"])
+        self.assertIn("score_details_json", clips[0])
+        self.assertGreaterEqual(clips[0]["start"], 8)
+        self.assertLessEqual(clips[0]["end"], 60.5)
+
+    def test_v2_pipeline_uses_deterministic_fill_when_no_judge_is_configured(self):
+        from services.clip_director.selection import select_dynamic_clips
+
+        clips = select_dynamic_clips(
+            [
+                {"start": 0, "end": 35, "text": "Here is a surprising hook with a clear payoff."},
+                {"start": 35.2, "end": 70, "text": "The answer explains the fix and why it matters."},
+            ],
+            duration=100,
+            audio_peaks=[],
+            llm_selector=None,
+            allow_fallback=False,
+            use_v2=True,
+        )
+
+        self.assertTrue(clips)
+        self.assertTrue(all(clip["timestamp_engine"] == "v2" for clip in clips))
+        self.assertTrue(any(clip["judge_status"] in {"deterministic_fill", "deterministic_rescue"} for clip in clips))
+
+    def test_v2_judge_rejects_fresh_timestamps_but_accepts_small_adjustments(self):
+        from services.clip_director.judge import apply_llm_judgement
+
+        candidates = [{
+            "candidate_id": "c1",
+            "start": 10.0,
+            "end": 50.0,
+            "duration": 40.0,
+            "text": "Here is a strong hook and payoff.",
+            "final_score": 0.8,
+            "candidate_source": "transcript_hook",
+        }]
+
+        accepted = apply_llm_judgement(
+            candidates,
+            [{"candidate_id": "c1", "start": 11.0, "end": 49.0, "reason": "Cleaner cut."}],
+            max_adjustment=1.5,
+        )
+        rejected = apply_llm_judgement(
+            candidates,
+            [{"candidate_id": "c1", "start": 20.0, "end": 70.0, "reason": "Invented a new moment."}],
+            max_adjustment=1.5,
+        )
+
+        self.assertEqual(1, len(accepted))
+        self.assertEqual(11.0, accepted[0]["start"])
+        self.assertEqual("accepted", accepted[0]["judge_status"])
+        self.assertEqual([], rejected)
+
+    def test_v2_score_formula_rewards_payoff_and_penalizes_mid_sentence(self):
+        from services.clip_director.scoring import score_candidate
+
+        candidate = {
+            "candidate_id": "c1",
+            "start": 10,
+            "end": 48,
+            "duration": 38,
+            "text": "Why does retention drop? Here is the mistake, the fix, and the payoff.",
+            "candidate_source": "qa",
+            "has_audio_peak": True,
+            "audio_peak_energy": 0.9,
+            "mid_sentence_start": False,
+            "mid_sentence_end": False,
+        }
+        weak = {
+            **candidate,
+            "candidate_id": "c2",
+            "text": "and then we were talking for a while without a conclusion",
+            "has_audio_peak": False,
+            "mid_sentence_start": True,
+            "mid_sentence_end": True,
+        }
+
+        strong_score = score_candidate(candidate)["final_score"]
+        weak_score = score_candidate(weak)["final_score"]
+
+        self.assertGreater(strong_score, weak_score)
+        self.assertGreater(strong_score, 0.6)
+
+    def test_v2_comedy_minimum_clip_targets_by_video_length(self):
+        from services.clip_director.selection import target_v2_clip_count
+
+        self.assertEqual(3, target_v2_clip_count(10 * 60))
+        self.assertEqual(3, target_v2_clip_count(20 * 60))
+        self.assertEqual(6, target_v2_clip_count(21 * 60))
+        self.assertEqual(6, target_v2_clip_count(45 * 60))
+        self.assertEqual(10, target_v2_clip_count(59 * 60))
+
+    def test_v2_comedy_scoring_prefers_laughter_applause_and_hinglish_jokes(self):
+        from services.clip_director.scoring import score_candidate
+
+        comedy = {
+            "candidate_id": "funny",
+            "candidate_source": "comedy",
+            "start": 100,
+            "end": 150,
+            "duration": 50,
+            "text": "Samay roast karta hai aur audience laughing applause ke saath joke ka punchline hit hota hai.",
+            "has_audio_peak": True,
+            "audio_peak_energy": 0.95,
+        }
+        generic = {
+            "candidate_id": "generic",
+            "candidate_source": "qa",
+            "start": 200,
+            "end": 250,
+            "duration": 50,
+            "text": "What is the truth foreign foreign",
+            "has_audio_peak": False,
+            "audio_peak_energy": 0.0,
+        }
+
+        self.assertGreater(score_candidate(comedy)["final_score"], 0.65)
+        self.assertGreater(score_candidate(comedy)["final_score"], score_candidate(generic)["final_score"])
+
+    def test_v2_rejects_low_score_judged_clips_and_fills_minimum_from_strong_comedy_candidates(self):
+        from services.clip_director.selection import select_dynamic_clips
+
+        segments = []
+        peaks = []
+        for idx in range(10):
+            start = 60 + idx * 210
+            segments.extend([
+                {"start": start, "end": start + 12, "text": f"Setup for joke {idx} starts with Samay roasting the panel."},
+                {"start": start + 12.2, "end": start + 32, "text": "The punchline lands and audience laughing applause gets very loud."},
+                {"start": start + 32.2, "end": start + 55, "text": "Everyone reacts to the funny moment and the payoff keeps going."},
+            ])
+            peaks.append({"start": start + 18, "end": start + 24, "peak_time": start + 21, "energy": 0.95})
+
+        def weak_judge(episode_map, constraints, ai_model):
+            candidates = episode_map["shortlisted_candidates"]
+            return [{
+                "candidate_id": candidates[-1]["candidate_id"],
+                "start": candidates[-1]["start"],
+                "end": candidates[-1]["end"],
+                "title": "Weak Choice",
+                "reason": "Only chose one.",
+            }]
+
+        clips = select_dynamic_clips(
+            segments,
+            duration=60 * 60,
+            audio_peaks=peaks,
+            ai_model="groq",
+            mode="shorts",
+            genre_hint="funny stage show",
+            llm_selector=weak_judge,
+            allow_fallback=False,
+            use_v2=True,
+        )
+
+        self.assertGreaterEqual(len(clips), 8)
+        self.assertLessEqual(len(clips), 12)
+        self.assertTrue(all(clip["final_score"] >= 0.45 for clip in clips))
+        self.assertTrue(any(clip["judge_status"] == "deterministic_fill" for clip in clips))
+        self.assertTrue(all(clip["candidate_source"] in {"audio_peak", "comedy"} for clip in clips))
+
+    def test_v2_judge_is_called_again_when_first_batch_returns_too_few_clips(self):
+        from services.clip_director.selection import select_dynamic_clips
+
+        segments = []
+        peaks = []
+        for idx in range(8):
+            start = 30 + idx * 180
+            segments.extend([
+                {"start": start, "end": start + 10, "text": f"Funny setup {idx} with comedy roast."},
+                {"start": start + 10.1, "end": start + 35, "text": "Punchline and audience laughing applause make this a strong funny clip."},
+                {"start": start + 35.2, "end": start + 58, "text": "Judges react and the payoff continues."},
+            ])
+            peaks.append({"start": start + 14, "end": start + 20, "peak_time": start + 17, "energy": 0.9})
+        calls = []
+
+        def sparse_judge(episode_map, constraints, ai_model):
+            calls.append([c["candidate_id"] for c in episode_map["shortlisted_candidates"]])
+            if len(calls) == 1:
+                return []
+            candidate = episode_map["shortlisted_candidates"][0]
+            return [{
+                "candidate_id": candidate["candidate_id"],
+                "start": candidate["start"],
+                "end": candidate["end"],
+                "reason": "Second batch accepted.",
+            }]
+
+        clips = select_dynamic_clips(
+            segments,
+            duration=30 * 60,
+            audio_peaks=peaks,
+            genre_hint="comedy",
+            llm_selector=sparse_judge,
+            allow_fallback=False,
+            use_v2=True,
+        )
+
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertGreaterEqual(len(clips), 6)
+
+    def test_v2_long_comedy_selection_spreads_clips_across_video(self):
+        from services.clip_director.selection import select_dynamic_clips
+
+        segments = []
+        peaks = []
+        for idx, start in enumerate([60, 180, 360, 900, 1500, 2100, 2700, 3300]):
+            segments.extend([
+                {"start": start, "end": start + 10, "text": f"Comedy setup {idx} with Samay roast."},
+                {"start": start + 10.1, "end": start + 33, "text": "Audience laughing applause after the punchline makes this very funny."},
+                {"start": start + 33.2, "end": start + 55, "text": "Judges react and the payoff continues."},
+            ])
+            peaks.append({"start": start + 13, "end": start + 20, "peak_time": start + 17, "energy": 0.92})
+
+        def accept_all(episode_map, constraints, ai_model):
+            return [
+                {
+                    "candidate_id": candidate["candidate_id"],
+                    "start": candidate["start"],
+                    "end": candidate["end"],
+                    "reason": "Accepted.",
+                }
+                for candidate in episode_map["shortlisted_candidates"]
+            ]
+
+        clips = select_dynamic_clips(
+            segments,
+            duration=3600,
+            audio_peaks=peaks,
+            genre_hint="funny stage show",
+            llm_selector=accept_all,
+            allow_fallback=False,
+            use_v2=True,
+        )
+
+        self.assertGreaterEqual(len(clips), 8)
+        self.assertTrue(any(clip["start"] >= 1800 for clip in clips))
+        self.assertTrue(any(clip["start"] < 600 for clip in clips))
+
+    def test_v2_long_comedy_rescues_sparse_transcript_when_judge_returns_nothing(self):
+        from services.clip_director.selection import select_dynamic_clips
+
+        segments = []
+        for idx in range(80):
+            start = idx * 42
+            text = "foreign" if idx % 3 == 0 else f"Panel banter moment {idx} continues with crowd energy"
+            segments.append({"start": start, "end": start + 18, "text": text})
+
+        clips = select_dynamic_clips(
+            segments,
+            duration=3560,
+            audio_peaks=[],
+            video_title="INDIA’S GOT LATENT S2 EP1",
+            genre_hint="funny stage show",
+            llm_selector=lambda *_args: [],
+            allow_fallback=False,
+            use_v2=True,
+        )
+
+        self.assertGreaterEqual(len(clips), 8)
+        self.assertTrue(all(clip["timestamp_engine"] == "v2" for clip in clips))
+        self.assertTrue(all(clip["score_details_json"] for clip in clips))
+        self.assertTrue(any(clip["start"] >= 1800 for clip in clips))
+        self.assertTrue(any("rescue" in clip["judge_status"] for clip in clips))
+
+    def test_v2_long_comedy_rescues_all_foreign_transcript(self):
+        from services.clip_director.selection import select_dynamic_clips
+
+        segments = [
+            {"start": idx * 3.0, "end": idx * 3.0 + 2.2, "text": "foreign"}
+            for idx in range(1165)
+        ]
+
+        clips = select_dynamic_clips(
+            segments,
+            duration=3560,
+            audio_peaks=[],
+            video_title="INDIA’S GOT LATENT S2 EP1",
+            genre_hint="funny stage show",
+            llm_selector=lambda *_args: [],
+            allow_fallback=False,
+            use_v2=True,
+        )
+
+        self.assertGreaterEqual(len(clips), 8)
+        self.assertTrue(all(clip["timestamp_engine"] == "v2" for clip in clips))
+        self.assertTrue(all(clip["score_details_json"] for clip in clips))
+        self.assertTrue(any(clip["start"] >= 1800 for clip in clips))
+
+    def test_short_video_complete_clip_uses_v2_metadata(self):
+        clip = main.select_clips_for_video(
+            [{"start": 0, "end": 57, "text": "Short complete video."}],
+            duration=57,
+            ai_model="groq",
+            video_title="Short funny video",
+        )[0]
+
+        self.assertEqual("v2", clip["timestamp_engine"])
+        self.assertEqual("complete_short", clip["candidate_source"])
+        self.assertGreater(clip["final_score"], 0)
+        self.assertIn("V2 timestamp engine", clip["score_details_json"])
+
     def test_audio_peaks_are_converted_to_candidate_moments(self):
         from services.clip_director.audio import peaks_to_moments
 
@@ -408,6 +791,7 @@ class ClipSelectionTest(unittest.TestCase):
             ai_model="gemini",
             mode="shorts",
             llm_selector=fake_llm_selector,
+            use_v2=False,
         )
 
         self.assertEqual(2, len(clips))
@@ -444,6 +828,7 @@ class ClipSelectionTest(unittest.TestCase):
             ai_model="gemini",
             mode="highlights",
             llm_selector=fake_llm_selector,
+            use_v2=False,
         )
 
         self.assertEqual(1, len(clips))
@@ -465,6 +850,7 @@ class ClipSelectionTest(unittest.TestCase):
             ai_model="openai",
             mode="shorts",
             llm_selector=lambda *_args: [],
+            use_v2=False,
         )
 
         self.assertTrue(clips)
@@ -500,6 +886,75 @@ class ClipSelectionTest(unittest.TestCase):
         self.assertEqual("highlights", selector.call_args.kwargs["mode"])
         self.assertEqual("funny stage show", selector.call_args.kwargs["genre_hint"])
         self.assertFalse(selector.call_args.kwargs["allow_fallback"])
+
+    def test_processing_stores_v2_timestamp_metadata(self):
+        source_path = main.UPLOADS_DIR / "unit_v2_metadata.mp4"
+        source_path.write_text("source")
+        main.db_write(
+            "INSERT INTO videos (youtube_video_id, title, source_path, status) VALUES (?,?,?,'waiting')",
+            ("unit_v2_metadata", "V2 metadata", str(source_path)),
+        )
+        video_id = main.db_read(
+            "SELECT id FROM videos WHERE youtube_video_id=?",
+            ("unit_v2_metadata",),
+        )[0]["id"]
+        self.addCleanup(lambda: main.db_write("DELETE FROM shorts WHERE video_id=?", (video_id,)))
+        self.addCleanup(lambda: main.db_write("DELETE FROM videos WHERE id=?", (video_id,)))
+        self.addCleanup(lambda: source_path.unlink(missing_ok=True))
+
+        clip = {
+            "start": 0,
+            "end": 35,
+            "duration": 35,
+            "text": "A strong hook with payoff.",
+            "title": "V2 Clip",
+            "virality_score": 88,
+            "completion_score": 82,
+            "hook_type": "qa",
+            "selection_reason": "Selected by V2.",
+            "timestamp_engine": "v2",
+            "candidate_source": "qa",
+            "final_score": 0.86,
+            "score_details_json": "{\"features\":{\"hook\":1.0}}",
+            "judge_status": "accepted",
+        }
+        with (
+            mock.patch.object(main, "missing_tools_message", return_value=""),
+            mock.patch.object(main, "is_valid_video", return_value=True),
+            mock.patch.object(main, "get_video_duration", return_value=80),
+            mock.patch.object(main, "extract_audio", return_value=True),
+            mock.patch.object(main, "transcribe_with_whisper_local", return_value=[clip]),
+            mock.patch.object(main, "select_clips_for_video", return_value=[clip]),
+            mock.patch.object(main, "export_short_clip", return_value=True),
+        ):
+            main._process_video_sync(video_id, str(source_path), captions_enabled=False)
+
+        short = main.db_read(
+            "SELECT timestamp_engine, candidate_source, final_score, score_details_json, judge_status "
+            "FROM shorts WHERE video_id=?",
+            (video_id,),
+        )[0]
+        self.assertEqual("v2", short["timestamp_engine"])
+        self.assertEqual("qa", short["candidate_source"])
+        self.assertAlmostEqual(0.86, short["final_score"])
+        self.assertIn("\"hook\"", short["score_details_json"])
+        self.assertEqual("accepted", short["judge_status"])
+
+    def test_main_does_not_fall_back_to_legacy_selector_when_v2_returns_no_clips(self):
+        with (
+            mock.patch.object(main.shorts_director, "select_dynamic_clips", return_value=[]) as dynamic_selector,
+            mock.patch.object(main.shorts_director, "select_director_clips") as legacy_selector,
+            mock.patch("services.clip_director.selection.viral_timestamp_engine_v2_enabled", return_value=True),
+        ):
+            clips = main.select_clips_for_video(
+                [{"start": 0, "end": 120, "text": "Comedy transcript."}],
+                duration=3600,
+                ai_model="groq",
+            )
+
+        self.assertEqual([], clips)
+        dynamic_selector.assert_called_once()
+        legacy_selector.assert_not_called()
 
     def test_complete_short_clip_keeps_source_as_one_clip(self):
         segments = [
@@ -950,6 +1405,159 @@ class DashboardRenderingTest(unittest.TestCase):
         self.assertIn('id="short-player-modal"', html)
         self.assertIn('id="short-player-video"', html)
 
+    def test_generated_short_renders_v2_timestamp_badges(self):
+        request = Request({
+            "type": "http",
+            "method": "GET",
+            "path": "/",
+            "headers": [],
+        })
+        response = main.templates.TemplateResponse(
+            request,
+            "index.html",
+            context={
+                "videos": [{
+                    "id": 1,
+                    "youtube_video_id": "completed_video",
+                    "title": "Completed video",
+                    "published_at": "",
+                    "thumbnail": "",
+                    "status": "completed",
+                    "source_path": str(main.UPLOADS_DIR / "completed_video.mp4"),
+                    "error_message": "",
+                    "steps_json": "",
+                    "shorts": [{
+                        "id": 7,
+                        "filename": "completed_video_short_01.mp4",
+                        "duration": 30,
+                        "start_time": 0,
+                        "end_time": 30,
+                        "title": "Strong hook moment",
+                        "timestamp_engine": "v2",
+                        "candidate_source": "qa",
+                        "final_score": 0.87,
+                        "judge_status": "accepted",
+                    }],
+                }],
+                "channel_id": "test",
+                "ai_model": "groq",
+                "has_youtube_key": True,
+                "has_openai_key": False,
+                "has_gemini_key": False,
+                "has_groq_key": True,
+            },
+        )
+        html = response.body.decode()
+
+        self.assertIn("Engine v2", html)
+        self.assertIn("Source qa", html)
+        self.assertIn("Score 87%", html)
+
+    def test_legacy_short_does_not_render_zero_v2_score(self):
+        request = Request({
+            "type": "http",
+            "method": "GET",
+            "path": "/",
+            "headers": [],
+        })
+        response = main.templates.TemplateResponse(
+            request,
+            "index.html",
+            context={
+                "videos": [{
+                    "id": 1,
+                    "youtube_video_id": "legacy_video",
+                    "title": "Legacy video",
+                    "published_at": "",
+                    "thumbnail": "",
+                    "status": "completed",
+                    "source_path": str(main.UPLOADS_DIR / "legacy_video.mp4"),
+                    "error_message": "",
+                    "steps_json": '[{"name":"Score & select highlights","status":"done","detail":"legacy"}]',
+                    "shorts": [{
+                        "id": 7,
+                        "filename": "legacy_video_short_01.mp4",
+                        "duration": 30,
+                        "start_time": 0,
+                        "end_time": 30,
+                        "title": "Legacy clip",
+                        "virality_score": 100,
+                        "completion_score": 100,
+                        "hook_type": "question",
+                        "final_score": 0.0,
+                        "timestamp_engine": "",
+                    }],
+                }],
+                "channel_id": "test",
+                "ai_model": "groq",
+                "has_youtube_key": True,
+                "has_openai_key": False,
+                "has_gemini_key": False,
+                "has_groq_key": True,
+            },
+        )
+        html = response.body.decode()
+
+        self.assertIn("Engine legacy", html)
+        self.assertNotIn("Score 0%", html)
+        self.assertIn("Processing Log", html)
+
+    def test_v2_short_renders_expandable_engine_log(self):
+        request = Request({
+            "type": "http",
+            "method": "GET",
+            "path": "/",
+            "headers": [],
+        })
+        response = main.templates.TemplateResponse(
+            request,
+            "index.html",
+            context={
+                "videos": [{
+                    "id": 1,
+                    "youtube_video_id": "v2_video",
+                    "title": "V2 video",
+                    "published_at": "",
+                    "thumbnail": "",
+                    "status": "completed",
+                    "source_path": str(main.UPLOADS_DIR / "v2_video.mp4"),
+                    "error_message": "",
+                    "steps_json": '[{"name":"Score & select highlights","status":"done","detail":"V2 selected 8 clips"}]',
+                    "shorts": [{
+                        "id": 7,
+                        "filename": "v2_video_short_01.mp4",
+                        "duration": 30,
+                        "start_time": 0,
+                        "end_time": 30,
+                        "title": "V2 clip",
+                        "timestamp_engine": "v2",
+                        "candidate_source": "audio_peak",
+                        "final_score": 0.82,
+                        "score_details_json": "{\"features\":{\"audioReaction\":0.9},\"penalties\":{}}",
+                        "judge_status": "deterministic_fill",
+                    }],
+                }],
+                "channel_id": "test",
+                "ai_model": "groq",
+                "has_youtube_key": True,
+                "has_openai_key": False,
+                "has_gemini_key": False,
+                "has_groq_key": True,
+            },
+        )
+        html = response.body.decode()
+
+        self.assertIn("V2 Engine Log", html)
+        self.assertIn("audioReaction", html)
+        self.assertIn("Processing Log", html)
+
+    def test_live_short_card_renders_v2_timestamp_badges(self):
+        js = (main.STATIC_DIR / "app.js").read_text()
+
+        self.assertIn("timestamp_engine", js)
+        self.assertIn("candidate_source", js)
+        self.assertIn("final_score", js)
+
     def test_video_card_has_stable_shorts_container_for_live_updates(self):
         request = Request({
             "type": "http",
@@ -1059,6 +1667,51 @@ class DashboardRenderingTest(unittest.TestCase):
         self.assertNotIn(">Approve<", html)
         self.assertNotIn(">Reject<", html)
         self.assertNotIn("short-status-approved", html)
+
+    def test_review_page_renders_v2_timestamp_badges(self):
+        request = Request({
+            "type": "http",
+            "method": "GET",
+            "path": "/short/44/review",
+            "headers": [],
+        })
+        response = main.templates.TemplateResponse(
+            request,
+            "review.html",
+            context={
+                "short": {
+                    "id": 44,
+                    "video_id": 2,
+                    "filename": "ready_short.mp4",
+                    "source_path": "",
+                    "title": "Ready Short",
+                    "upload_title": "Ready Short",
+                    "description": "",
+                    "upload_description": "",
+                    "caption_text": "",
+                    "start_time": 0,
+                    "end_time": 21,
+                    "duration": 21,
+                    "status": "draft",
+                    "source_title": "Source video",
+                    "youtube_video_id": "source123",
+                    "virality_score": None,
+                    "completion_score": None,
+                    "latest_upload": None,
+                    "timestamp_engine": "v2",
+                    "candidate_source": "audio_peak",
+                    "final_score": 0.91,
+                    "judge_status": "accepted",
+                },
+                "youtube_connected": False,
+            },
+        )
+        html = response.body.decode()
+
+        self.assertIn("Engine v2", html)
+        self.assertIn("Source audio_peak", html)
+        self.assertIn("Score 91%", html)
+        self.assertIn("Judge accepted", html)
 
 
 class StudioWorkflowTest(unittest.TestCase):
@@ -1179,6 +1832,17 @@ class StudioWorkflowTest(unittest.TestCase):
         srt_path = export_short_clip.call_args.args[4]
         self.assertTrue(srt_path.endswith(".srt"))
         self.assertIn("Edited caption for export", (main.OUTPUTS_DIR / "studio_workflow_short_01.srt").read_text())
+
+    def test_regenerate_short_writes_unicode_srt_as_utf8(self):
+        unicode_caption = "यह joke 😂 audience ko hasa deta hai."
+        main.update_short_metadata(self.short_id, {"caption_text": unicode_caption})
+
+        with mock.patch.object(main, "export_short_clip", return_value=True):
+            main.regenerate_short(self.short_id)
+
+        srt_text = (main.OUTPUTS_DIR / "studio_workflow_short_01.srt").read_text(encoding="utf-8")
+        self.assertIn("😂", srt_text)
+        self.assertIn("यह", srt_text)
 
     def test_upload_requires_approved_short_and_records_success(self):
         with self.assertRaises(ValueError):

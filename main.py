@@ -26,6 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from services import exporting, presets, shorts_director, youtube_upload
+from services.clip_director import selection as clip_selection
 from services.clip_director.llm import request_llm_selection
 
 # ---------------------------------------------------------------------------
@@ -268,6 +269,11 @@ def init_db():
         "ALTER TABLE shorts ADD COLUMN upload_title TEXT",
         "ALTER TABLE shorts ADD COLUMN upload_description TEXT",
         "ALTER TABLE shorts ADD COLUMN scheduled_at TEXT",
+        "ALTER TABLE shorts ADD COLUMN timestamp_engine TEXT",
+        "ALTER TABLE shorts ADD COLUMN candidate_source TEXT",
+        "ALTER TABLE shorts ADD COLUMN final_score REAL",
+        "ALTER TABLE shorts ADD COLUMN score_details_json TEXT",
+        "ALTER TABLE shorts ADD COLUMN judge_status TEXT",
     ]:
         try:
             conn.execute(col_sql)
@@ -698,7 +704,9 @@ def regenerate_short(short_id: int, preset_config: Optional[dict] = None) -> dic
     if config.get("captions_enabled", True) and caption_text:
         srt_path = OUTPUTS_DIR / f"{Path(filename).stem}.srt"
         srt_path.write_text(generate_srt(
-            [{"start": start, "end": end, "text": caption_text}], start, end))
+            [{"start": start, "end": end, "text": caption_text}], start, end),
+            encoding="utf-8",
+        )
     elif filename:
         (OUTPUTS_DIR / f"{Path(filename).stem}.srt").unlink(missing_ok=True)
     if not export_short_clip(source_path, str(output_path), start, duration, str(srt_path) if srt_path else None, preset=config):
@@ -1758,6 +1766,8 @@ def target_clip_count_for_duration(duration: float) -> int:
 
 
 def complete_short_clip(segments: list[dict], duration: float) -> list[dict]:
+    if clip_selection.viral_timestamp_engine_v2_enabled():
+        return clip_selection.complete_short_clip_v2(segments, duration)
     return shorts_director.complete_short_clip(segments, duration)
 
 
@@ -1784,6 +1794,8 @@ def select_clips_for_video(
         llm_selector=request_dynamic_clip_selection,
         allow_fallback=False,
     )
+    if clip_selection.viral_timestamp_engine_v2_enabled():
+        return selected
     return selected or shorts_director.select_director_clips(
         segments,
         duration=duration,
@@ -2100,7 +2112,7 @@ def _process_video_sync(
             srt_path = None
             if srt_content.strip():
                 srt_path = str(OUTPUTS_DIR / f"{safe_id}_short_{idx:02d}.srt")
-                Path(srt_path).write_text(srt_content)
+                Path(srt_path).write_text(srt_content, encoding="utf-8")
             out_filename = f"{safe_id}_short_{idx:02d}.mp4"
             if export_short_clip(source_path, str(OUTPUTS_DIR / out_filename), start, clip_dur, srt_path, video_id=video_id):
                 enriched_clip = shorts_director.enrich_clip_metadata({
@@ -2120,8 +2132,9 @@ def _process_video_sync(
                     "INSERT INTO shorts "
                     "(video_id, filename, start_time, end_time, duration, caption_text, title, description, "
                     "virality_score, completion_score, hook_type, selection_reason, status, "
-                    "original_start_time, original_end_time, upload_title, upload_description, updated_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))",
+                    "original_start_time, original_end_time, upload_title, upload_description, "
+                    "timestamp_engine, candidate_source, final_score, score_details_json, judge_status, updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))",
                     (
                         video_id,
                         out_filename,
@@ -2140,6 +2153,11 @@ def _process_video_sync(
                         end,
                         upload_title[:120],
                         upload_description,
+                        enriched_clip.get("timestamp_engine", "")[:20],
+                        enriched_clip.get("candidate_source", "")[:40],
+                        float(enriched_clip.get("final_score", 0) or 0),
+                        enriched_clip.get("score_details_json", "")[:4000],
+                        enriched_clip.get("judge_status", "")[:30],
                     ),
                 )
                 generated += 1
@@ -2282,6 +2300,10 @@ async def download_and_process(video_id: int, captions_enabled: bool = True):
 async def dashboard(request: Request):
     videos = db_read("SELECT * FROM videos ORDER BY created_at DESC")
     for v in videos:
+        try:
+            v["steps"] = json.loads(v.get("steps_json") or "[]")
+        except Exception:
+            v["steps"] = []
         v["shorts"] = attach_latest_uploads(db_read(
             "SELECT * FROM shorts WHERE video_id=? ORDER BY start_time", (
                 v["id"],)

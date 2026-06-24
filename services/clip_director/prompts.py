@@ -4,6 +4,30 @@ from .types import ClipConstraints, EpisodeMap
 
 
 def build_director_prompt(episode_map: EpisodeMap, constraints: ClipConstraints) -> str:
+    shortlisted = episode_map.get("shortlisted_candidates", [])
+    if shortlisted:
+        payload = {
+            "title": episode_map.get("title", ""),
+            "duration": episode_map.get("duration", 0),
+            "mode": episode_map.get("mode", "shorts"),
+            "genre_hint": episode_map.get("genre_hint", ""),
+            "detected_genre": episode_map.get("detected_genre", "auto"),
+            "constraints": constraints,
+            "shortlisted_candidates": shortlisted[:40],
+        }
+        return (
+            "You are a strict viral clip judge. Rank or reject only the shortlisted candidates provided. "
+            "Do not create new timestamps. Do not choose a moment unless its candidate_id is present in the payload. "
+            "You may suggest a small start/end adjustment only when it is within 1.5 seconds of the candidate boundary. "
+            f"Clips must stay between {constraints['min_duration']} and {constraints['max_duration']} seconds. "
+            f"Return at most {constraints['safety_max_clips']} clips.\n"
+            "Return strict JSON only: {\"clips\":[{\"candidate_id\":\"v2-1\",\"rank\":1,"
+            "\"start\":0,\"end\":45,\"title\":\"...\",\"description\":\"...\","
+            "\"upload_title\":\"...\",\"upload_description\":\"...\",\"hook\":\"...\","
+            "\"context\":\"...\",\"value\":\"...\",\"payoff\":\"...\",\"virality_score\":90,"
+            "\"completion_score\":90,\"hook_type\":\"story\",\"reason\":\"...\"}]}.\n\n"
+            f"Shortlist:\n{json.dumps(payload, ensure_ascii=False)}"
+        )
     payload = {
         "title": episode_map.get("title", ""),
         "duration": episode_map.get("duration", 0),

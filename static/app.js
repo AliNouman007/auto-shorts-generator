@@ -860,9 +860,24 @@ function renderShortCard(short) {
   const hook = short.hook_type
     ? `<span class="score-pill">${escHtml(short.hook_type)}</span>`
     : "";
+  const engineLabel = short.timestamp_engine || "legacy";
+  const timestampEngine = `<span class="score-pill">Engine ${escHtml(engineLabel)}</span>`;
+  const candidateSource = short.candidate_source
+    ? `<span class="score-pill">Source ${escHtml(short.candidate_source)}</span>`
+    : "";
+  const finalScore =
+    short.timestamp_engine &&
+    short.final_score !== null &&
+    short.final_score !== undefined &&
+    Number(short.final_score) > 0
+      ? `<span class="score-pill">Score ${Math.round(Number(short.final_score) * 100)}%</span>`
+      : "";
+  const engineLog = short.score_details_json
+    ? `<details class="engine-log engine-log-short"><summary>V2 Engine Log</summary><pre>${escHtml(short.score_details_json)}</pre></details>`
+    : "";
   const scores =
-    virality || completion || hook
-      ? `<div class="short-score-row">${virality}${completion}${hook}</div>`
+    virality || completion || hook || timestampEngine || candidateSource || finalScore
+      ? `<div class="short-score-row">${virality}${completion}${hook}${timestampEngine}${candidateSource}${finalScore}</div>`
       : "";
   const reason = short.selection_reason
     ? `<div class="short-reason">${escHtml(short.selection_reason)}</div>`
@@ -883,6 +898,7 @@ function renderShortCard(short) {
     <div class="short-meta">${duration}${range}</div>
     ${scores}
     ${reason}
+    ${engineLog}
     <div style="display:flex;gap:0.4rem;flex-wrap:wrap;margin-top:0.25rem">
       <button class="btn btn-primary btn-sm" onclick="openShortPlayer('${escJsString(short.filename || "")}')">
         <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 3 20 12 6 21 6 3"/></svg>

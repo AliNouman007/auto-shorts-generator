@@ -481,6 +481,41 @@ body {
   line-height: 1.45;
 }
 
+.engine-log {
+  margin-top: 0.55rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #020617;
+  color: #cbd5e1;
+  overflow: hidden;
+}
+
+.engine-log summary {
+  cursor: pointer;
+  padding: 0.55rem 0.7rem;
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: #93c5fd;
+  user-select: none;
+}
+
+.engine-log pre {
+  margin: 0;
+  padding: 0.7rem;
+  border-top: 1px solid var(--border);
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 0.72rem;
+  line-height: 1.45;
+}
+
+.engine-log-short {
+  margin-top: 0.45rem;
+}
+
 /* ---------- Short player modal ---------- */
 body.modal-open { overflow: hidden; }
 

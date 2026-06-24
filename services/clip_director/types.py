@@ -19,6 +19,8 @@ class TranscriptSegment(TypedDict, total=False):
 
 
 class CandidateMoment(TypedDict, total=False):
+    candidate_id: str
+    candidate_source: str
     start: float
     end: float
     duration: float
@@ -26,6 +28,12 @@ class CandidateMoment(TypedDict, total=False):
     has_audio_peak: bool
     audio_peak_energy: float
     peak_time: float
+    feature_scores: dict
+    penalties: dict
+    base_score: float
+    penalty: float
+    final_score: float
+    boundary_notes: list[str]
 
 
 class EpisodeMap(TypedDict, total=False):
@@ -37,6 +45,7 @@ class EpisodeMap(TypedDict, total=False):
     segments: list[TranscriptSegment]
     audio_peaks: list[AudioPeak]
     candidate_moments: list[CandidateMoment]
+    shortlisted_candidates: list[CandidateMoment]
 
 
 class ClipConstraints(TypedDict):
@@ -47,6 +56,8 @@ class ClipConstraints(TypedDict):
 
 
 class DirectorSelection(TypedDict, total=False):
+    candidate_id: str
+    rank: int
     start: float
     end: float
     title: str
@@ -62,3 +73,8 @@ class DirectorSelection(TypedDict, total=False):
     hook_type: str
     reason: str
     selection_reason: str
+    timestamp_engine: str
+    candidate_source: str
+    final_score: float
+    score_details_json: str
+    judge_status: str
