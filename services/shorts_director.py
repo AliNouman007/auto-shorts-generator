@@ -94,6 +94,7 @@ def normalize_director_preset(preset=None) -> dict:
         "hard_max_clip_duration": hard_max,
         "allow_three_minute_shorts": allow_three_minutes,
         "director_mode": director_mode,
+        "genre": config.get("genre", "auto-detect"),
     })
     return config
 
@@ -173,13 +174,13 @@ def sentence_groups(segments: list[dict]) -> list[dict]:
         else:
             gap = start - current["end"]
             current_duration = current["end"] - current["start"]
-            if gap > 2.5 or current_duration > 18:
+            if gap > 3.0 or current_duration > 30:
                 groups.append(_finish_group(current))
                 current = {"start": start, "end": end, "texts": [text]}
             else:
                 current["end"] = end
                 current["texts"].append(text)
-        if current and ends_cleanly(text) and current["end"] - current["start"] >= 4:
+        if current and ends_cleanly(text) and current["end"] - current["start"] >= 5:
             groups.append(_finish_group(current))
             current = None
     if current:
@@ -413,63 +414,6 @@ def target_clip_count_for_duration(duration: float) -> int:
     return 6
 
 
-def complete_short_clip(segments: list[dict], duration: float) -> list[dict]:
-    text = " ".join(
-        str(seg.get("text", "")).strip()
-        for seg in segments
-        if str(seg.get("text", "")).strip()
-    )
-    virality, completion, _ = candidate_scores(text, duration) if text else (65, 90, "complete_short")
-    return [enrich_clip_metadata({
-        "start": 0,
-        "end": duration,
-        "duration": duration,
-        "text": text,
-        "title": "Complete short",
-        "virality_score": virality,
-        "completion_score": max(90, completion),
-        "hook_type": "complete_short",
-        "selection_reason": "The source video is already short, so it is kept as one complete clip instead of being split.",
-        "reason": "The source video is already short, so it is kept as one complete clip instead of being split.",
-    })]
-
-
-def fallback_clips(duration: float, count: int = 5) -> list[dict]:
-    if duration <= 90:
-        return [enrich_clip_metadata({
-            "start": 0,
-            "end": duration,
-            "duration": duration,
-            "text": "",
-            "title": "Complete short",
-            "virality_score": 50,
-            "completion_score": 90,
-            "hook_type": "complete_short",
-            "selection_reason": "The source video is already short, so fallback kept it as one complete clip.",
-        })]
-    clip_duration = 35.0
-    skip_start = 60.0 if duration > 180 else 0.0
-    usable = duration - skip_start - 30
-    count = min(count, target_clip_count_for_duration(duration))
-    if usable < clip_duration:
-        count = max(1, int(usable // clip_duration)) or 1
-    step = usable / count
-    return [
-        enrich_clip_metadata({
-            "start": skip_start + i * step,
-            "end": min(skip_start + i * step + clip_duration, duration - 5),
-            "duration": min(clip_duration, duration - 5 - (skip_start + i * step)),
-            "text": "",
-            "title": f"Fallback clip {i + 1}",
-            "virality_score": 50,
-            "completion_score": 50,
-            "hook_type": "fallback",
-            "selection_reason": "Generated from fallback spacing because transcript ranking was unavailable.",
-        })
-        for i in range(count)
-    ]
-
-
 def snap_clip_to_segment_boundaries(clip: dict, segments: list[dict]) -> dict:
     overlapping = _segments_for_clip(clip, segments)
     if not overlapping:
@@ -554,7 +498,7 @@ def enrich_clip_metadata(clip: dict) -> dict:
         clip.get("upload_description") or _upload_description(description, clip.get("hook_type"), text)
     ).strip()[:700]
     selection_reason = str(
-        clip.get("selection_reason") or clip.get("reason") or "Selected for a clear Hook, Context, Value, and Payoff structure."
+        clip.get("selection_reason") or clip.get("reason") or "Selected for quality content"
     ).strip()[:500]
     start = float(clip.get("start", 0))
     end = float(clip.get("end", start))
@@ -572,9 +516,9 @@ def enrich_clip_metadata(clip: dict) -> dict:
         "context": context[:300],
         "value": value[:400],
         "payoff": payoff[:260],
-        "hook_type": _clean_hook_type(clip.get("hook_type") or classify_hook_type(text)),
-        "virality_score": clamp_score(float(clip.get("virality_score") or 60)),
-        "completion_score": clamp_score(float(clip.get("completion_score") or 70)),
+        "hook_type": _clean_hook_type(clip.get("hook_type") or "story"),
+        "virality_score": clamp_score(float(clip.get("virality_score", 60)) + (clip.get("audio_peak_energy", 0) * 30)),
+        "completion_score": clamp_score(float(clip.get("completion_score", 70))),
         "selection_reason": selection_reason,
         "reason": selection_reason,
     }
@@ -644,7 +588,7 @@ def _clean_upload_title(title: str) -> str:
     title = _clean_title(title)
     generic = {"highlight", "highlight 1", "untitled highlight", "fallback clip"}
     if title.lower() in generic:
-        title = "Watch This Before You Make This Mistake"
+        title = "You Have to See This!"
     if len(title) > 60:
         title = title[:57].rstrip(" -:,.") + "..."
     return title
@@ -666,16 +610,71 @@ def _description_from_parts(hook: str, value: str, payoff: str) -> str:
 def _upload_description(description: str, hook_type: str | None, text: str) -> str:
     tags = ["#shorts"]
     lowered = (text or "").lower()
+    if any(word in lowered for word in ("funny", "comedy", "laugh", "joke", "hilarious")):
+        tags.extend(["#comedy", "#funny"])
+    if any(word in lowered for word in ("talent", "audition", "judge", "stage")):
+        tags.extend(["#talent", "#show"])
     if any(word in lowered for word in ("edit", "short", "video", "creator", "youtube")):
         tags.extend(["#editing", "#creator"])
-    if any(word in lowered for word in ("mistake", "problem", "fix")):
-        tags.extend(["#tips", "#growth"])
     if _clean_hook_type(hook_type) == "story":
         tags.append("#story")
     while len(tags) < 4:
-        tags.append("#learn")
+        tags.append("#viral")
     unique_tags = []
     for tag in tags:
         if tag not in unique_tags:
             unique_tags.append(tag)
     return f"{description.strip()}\n\n{' '.join(unique_tags[:4])}".strip()
+
+
+def complete_short_clip(segments: list[dict], duration: float) -> list[dict]:
+    text = " ".join(
+        str(seg.get("text", "")).strip()
+        for seg in segments
+        if str(seg.get("text", "")).strip()
+    )
+    reason = "The source video is already short, so it is kept as one complete clip and not being split."
+    return [enrich_clip_metadata({
+        "start": 0,
+        "end": duration,
+        "duration": duration,
+        "text": text,
+        "title": "Complete short",
+        "virality_score": 65 if text else 50,
+        "completion_score": 90,
+        "hook_type": "complete_short",
+        "selection_reason": reason,
+        "reason": reason,
+    })]
+
+
+def fallback_clips(duration: float, count: int = 8) -> list[dict]:
+    if duration <= 90:
+        return complete_short_clip([], duration)
+    clip_duration = 120.0
+    skip_start = 60.0 if duration > 180 else 0.0
+    usable = duration - skip_start - 30
+    count = min(count, max(3, int(usable / 120)))
+    if usable < clip_duration:
+        count = max(1, int(usable // clip_duration)) or 1
+    step = usable / count
+    return [
+        enrich_clip_metadata({
+            "start": skip_start + i * step,
+            "end": min(skip_start + i * step + clip_duration, duration - 5),
+            "duration": min(clip_duration, duration - 5 - (skip_start + i * step)),
+            "text": "",
+            "title": f"Highlight {i + 1}",
+            "virality_score": 50,
+            "completion_score": 50,
+            "hook_type": "fallback",
+            "selection_reason": "Generated from fallback spacing",
+        })
+        for i in range(count)
+    ]
+
+
+def select_dynamic_clips(*args, **kwargs) -> list[dict]:
+    from services.clip_director.selection import select_dynamic_clips as _select_dynamic_clips
+
+    return _select_dynamic_clips(*args, **kwargs)

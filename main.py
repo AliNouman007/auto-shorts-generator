@@ -26,6 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from services import exporting, presets, shorts_director, youtube_upload
+from services.clip_director.llm import request_llm_selection
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -80,6 +81,7 @@ load_env_file()
 YOUTUBE_API_KEY = env_value("YOUTUBE_API_KEY")
 YOUTUBE_CHANNEL_ID = env_value("YOUTUBE_CHANNEL_ID")
 OPENAI_API_KEY = env_value("OPENAI_API_KEY")
+OPENAI_LLM_MODEL = env_value("OPENAI_LLM_MODEL", "gpt-4o-mini")
 GEMINI_API_KEY = env_value("GEMINI_API_KEY")
 GEMINI_MODEL = env_value("GEMINI_MODEL", "gemini-2.0-flash")
 GROQ_API_KEY = env_value("GROQ_API_KEY")
@@ -453,23 +455,28 @@ def cleanup_cancelled_video(video_id: int, source_started_as_download: bool = Fa
 
     video = rows[0]
     safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", video["youtube_video_id"])
-    for short in db_read("SELECT id FROM shorts WHERE video_id=?", (video_id,)):
-        delete_short_record(short["id"])
+    existing_short_files = {
+        Path(row["filename"]).name
+        for row in db_read("SELECT filename FROM shorts WHERE video_id=?", (video_id,))
+        if row["filename"]
+    }
+    protected_outputs = set(existing_short_files)
+    protected_outputs.update(
+        f"{Path(filename).stem}.srt"
+        for filename in existing_short_files
+    )
     for partial in OUTPUTS_DIR.glob(f"{safe_id}_short_*"):
-        if partial.suffix in (".mp4", ".srt"):
+        if partial.suffix in (".mp4", ".srt") and partial.name not in protected_outputs:
             partial.unlink(missing_ok=True)
 
     source_path = video.get("source_path") or ""
-    if source_started_as_download and source_path:
-        Path(source_path).unlink(missing_ok=True)
-        source_path = ""
 
     next_status = "detected"
     if source_path and Path(source_path).exists():
         next_status = "waiting"
 
     cancelled_steps = [{"name": "Cancelled",
-                        "status": "error", "detail": "Progress discarded."}]
+                        "status": "error", "detail": "Current generation stopped. Existing completed shorts were kept."}]
     db_write(
         "UPDATE videos SET status=?, source_path=?, error_message=NULL, steps_json=?, updated_at=datetime('now') WHERE id=?",
         (next_status, source_path, json.dumps(cancelled_steps), video_id),
@@ -1194,6 +1201,116 @@ def captions_enabled_from_body(body: dict) -> bool:
     return body.get("captions_enabled", True) is not False
 
 
+class GroqRequestTooLarge(RuntimeError):
+    pass
+
+
+def audio_file_size_bytes(audio_path: str) -> int:
+    try:
+        return Path(audio_path).stat().st_size
+    except OSError:
+        return 0
+
+
+def should_chunk_groq_audio(audio_path: str, limit_bytes: int = 24 * 1024 * 1024) -> bool:
+    return audio_file_size_bytes(audio_path) > limit_bytes
+
+
+def get_audio_duration(audio_path: str) -> float:
+    try:
+        result = run_command(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                audio_path,
+            ],
+            timeout=60,
+        )
+        if result.returncode != 0:
+            return 0.0
+        return max(0.0, float((result.stdout or "0").strip() or 0))
+    except Exception:
+        return 0.0
+
+
+def build_audio_chunk_path(audio_path: str, index: int) -> str:
+    path = Path(audio_path)
+    return str(path.with_name(f"{path.stem}_chunk_{index:03d}{path.suffix}"))
+
+
+def split_audio_for_transcription(
+    audio_path: str,
+    chunk_seconds: int = 600,
+    video_id: Optional[int] = None,
+) -> list[dict]:
+    duration = get_audio_duration(audio_path)
+    if duration <= 0:
+        return [{"path": audio_path, "offset": 0.0}]
+    chunks = []
+    offset = 0.0
+    index = 1
+    while offset < duration:
+        chunk_path = build_audio_chunk_path(audio_path, index)
+        chunk_duration = min(float(chunk_seconds), duration - offset)
+        result = run_command(
+            [
+                "ffmpeg",
+                "-y",
+                "-ss",
+                f"{offset:g}",
+                "-i",
+                audio_path,
+                "-t",
+                f"{chunk_duration:g}",
+                "-vn",
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                "-q:a",
+                "0",
+                chunk_path,
+            ],
+            timeout=300,
+            video_id=video_id,
+        )
+        if result.returncode != 0:
+            raise RuntimeError("FFmpeg audio chunking failed.")
+        chunks.append({"path": chunk_path, "offset": float(offset)})
+        offset += float(chunk_seconds)
+        index += 1
+    return chunks
+
+
+def offset_transcription_segments(segments: list[dict], offset_seconds: float) -> list[dict]:
+    shifted = []
+    for segment in segments or []:
+        try:
+            start = float(segment.get("start", 0)) + float(offset_seconds)
+            end = float(segment.get("end", start)) + float(offset_seconds)
+        except (TypeError, ValueError):
+            continue
+        shifted.append({
+            **segment,
+            "start": start,
+            "end": end,
+            "text": str(segment.get("text", "")).strip(),
+        })
+    return shifted
+
+
+def merge_transcription_chunks(chunk_results: list[list[dict]]) -> list[dict]:
+    merged = []
+    for segments in chunk_results:
+        merged.extend(segments or [])
+    return sorted(merged, key=lambda segment: float(segment.get("start", 0)))
+
+
 def transcribe_with_whisper_local(audio_path: str, video_id: Optional[int] = None) -> Optional[list[dict]]:
     """Try the local openai-whisper CLI. Returns segments list or None."""
     try:
@@ -1245,31 +1362,70 @@ async def transcribe_with_openai_api(audio_path: str) -> Optional[list[dict]]:
     return None
 
 
-async def transcribe_with_groq_api(audio_path: str) -> Optional[list[dict]]:
+async def transcribe_groq_audio_file(audio_path: str) -> list[dict]:
+    if not GROQ_API_KEY:
+        return []
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        with open(audio_path, "rb") as f:
+            response = await client.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                files={"file": (Path(audio_path).name, f, "audio/mpeg")},
+                data={
+                    **build_whisper_transcription_data(GROQ_MODEL),
+                    "temperature": "0",
+                },
+            )
+    if response.status_code != 200:
+        try:
+            message = response.json().get("error", {}).get("message", "")
+        except Exception:
+            message = response.text
+        error_message = f"Groq API error ({response.status_code}): {message[:500]}"
+        if response.status_code == 413:
+            raise GroqRequestTooLarge(error_message)
+        raise RuntimeError(error_message)
+    return response.json().get("segments", [])
+
+
+async def transcribe_groq_audio_chunks(
+    audio_path: str,
+    chunk_seconds: int = 600,
+    video_id: Optional[int] = None,
+) -> list[dict]:
+    chunks = split_audio_for_transcription(
+        audio_path,
+        chunk_seconds=chunk_seconds,
+        video_id=video_id,
+    )
+    chunk_results = []
+    try:
+        for chunk in chunks:
+            chunk_path = str(chunk["path"])
+            offset = float(chunk.get("offset", 0))
+            segments = await transcribe_groq_audio_file(chunk_path)
+            chunk_results.append(offset_transcription_segments(segments, offset))
+    finally:
+        for chunk in chunks:
+            chunk_path = str(chunk["path"])
+            if chunk_path != audio_path:
+                Path(chunk_path).unlink(missing_ok=True)
+    return merge_transcription_chunks(chunk_results)
+
+
+async def transcribe_with_groq_api(audio_path: str, video_id: Optional[int] = None) -> Optional[list[dict]]:
     """Transcribe via Groq's OpenAI-compatible Whisper endpoint."""
     if not GROQ_API_KEY:
         return None
 
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            with open(audio_path, "rb") as f:
-                response = await client.post(
-                    "https://api.groq.com/openai/v1/audio/transcriptions",
-                    headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                    files={"file": (Path(audio_path).name, f, "audio/mpeg")},
-                    data={
-                        **build_whisper_transcription_data(GROQ_MODEL),
-                        "temperature": "0",
-                    },
-                )
-        if response.status_code != 200:
-            try:
-                message = response.json().get("error", {}).get("message", "")
-            except Exception:
-                message = response.text
-            raise RuntimeError(
-                f"Groq API error ({response.status_code}): {message[:500]}")
-        return response.json().get("segments", [])
+        if should_chunk_groq_audio(audio_path):
+            return await transcribe_groq_audio_chunks(audio_path, video_id=video_id)
+        try:
+            return await transcribe_groq_audio_file(audio_path)
+        except GroqRequestTooLarge:
+            return await transcribe_groq_audio_chunks(audio_path, video_id=video_id)
     except RuntimeError:
         raise
     except Exception as exc:
@@ -1556,6 +1712,20 @@ def _merge_llm_rankings(candidates: list[dict], llm_items: list, target_count: i
     )
 
 
+def request_dynamic_clip_selection(episode_map: dict, constraints: dict, ai_model: str) -> list[dict]:
+    return request_llm_selection(
+        episode_map,
+        constraints,
+        ai_model,
+        openai_api_key=OPENAI_API_KEY,
+        openai_model=OPENAI_LLM_MODEL,
+        groq_api_key=GROQ_API_KEY,
+        groq_model=GROQ_LLM_MODEL,
+        gemini_api_key=GEMINI_API_KEY,
+        gemini_model=GEMINI_MODEL,
+    )
+
+
 def build_clips_from_segments(
     segments: list[dict],
     target_count: int = 5,
@@ -1566,25 +1736,15 @@ def build_clips_from_segments(
     if not segments:
         return []
     source_duration = max((float(seg.get("end", 0)) for seg in segments), default=0)
-    config = preset_config_for_export({
-        "min_clip_duration": min_duration,
-        "hard_max_clip_duration": max_duration,
-        "allow_three_minute_shorts": max_duration > 180,
-    })
-    candidates = shorts_director.build_director_candidates(
-        segments,
-        duration=source_duration,
-        preset=config,
-        limit=max(20, target_count * 5),
-    )
-    ranked = rank_candidates_with_llm(candidates, ai_model=ai_model, target_count=target_count)
-    return shorts_director.finalize_director_clips(
-        ranked,
+    mode = "highlights" if max_duration > 180 else "shorts"
+    clips = shorts_director.select_dynamic_clips(
         segments,
         source_duration,
-        config,
-        target_count=target_count,
+        ai_model=ai_model,
+        mode=mode,
+        llm_selector=request_dynamic_clip_selection,
     )
+    return clips[:target_count] if target_count else clips
 
 
 def target_clip_count_for_duration(duration: float) -> int:
@@ -1601,24 +1761,28 @@ def complete_short_clip(segments: list[dict], duration: float) -> list[dict]:
     return shorts_director.complete_short_clip(segments, duration)
 
 
-def select_clips_for_video(segments: list[dict], duration: float, ai_model: str) -> list[dict]:
+def select_clips_for_video(
+    segments: list[dict],
+    duration: float,
+    ai_model: str,
+    *,
+    audio_path: str | None = None,
+    video_title: str = "",
+    preset: Optional[dict] = None,
+) -> list[dict]:
     if duration <= 90:
         return complete_short_clip(segments, duration)
-    target_count = target_clip_count_for_duration(duration)
-    config = preset_config_for_export()
-    candidates = shorts_director.build_director_candidates(
-        segments,
-        duration=duration,
-        preset=config,
-        limit=max(20, target_count * 5),
-    )
-    ranked = rank_candidates_with_llm(candidates, ai_model=ai_model, target_count=target_count)
-    selected = shorts_director.finalize_director_clips(
-        ranked,
+    config = preset_config_for_export(preset)
+    selected = shorts_director.select_dynamic_clips(
         segments,
         duration,
-        config,
-        target_count=target_count,
+        audio_path=audio_path,
+        video_title=video_title,
+        mode=config.get("clip_output_mode", "shorts"),
+        genre_hint=config.get("genre_hint", ""),
+        ai_model=ai_model,
+        llm_selector=request_dynamic_clip_selection,
+        allow_fallback=False,
     )
     return selected or shorts_director.select_director_clips(
         segments,
@@ -1818,8 +1982,9 @@ def _process_video_sync(
         ensure_not_cancelled(video_id)
 
         rows = db_read(
-            "SELECT youtube_video_id FROM videos WHERE id=?", (video_id,))
+            "SELECT youtube_video_id, title FROM videos WHERE id=?", (video_id,))
         yt_id = rows[0]["youtube_video_id"] if rows else str(video_id)
+        source_title = rows[0]["title"] if rows else ""
         safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", yt_id)
         ai_model = effective_ai_model()
         segments: list[dict] = []
@@ -1847,11 +2012,12 @@ def _process_video_sync(
                     step(
                         2, "error", "GROQ_API_KEY not configured — using fallback spacing")
                 else:
-                    step(2, "running", "Groq Whisper…")
+                    groq_detail = "Groq Whisper chunked..." if should_chunk_groq_audio(audio_path) else "Groq Whisper..."
+                    step(2, "running", groq_detail)
                     loop = asyncio.new_event_loop()
                     try:
                         segs = loop.run_until_complete(
-                            transcribe_with_groq_api(audio_path))
+                            transcribe_with_groq_api(audio_path, video_id=video_id))
                     except RuntimeError as exc:
                         segs = None
                         step(2, "error", str(exc))
@@ -1902,17 +2068,24 @@ def _process_video_sync(
 
         # ── Step 3: Score & select ────────────────────────────────────────────
         step(3, "running")
+        if not segments:
+            step(3, "error", "Transcription failed, so clips were not generated. Retry after fixing transcription.")
+            raise ValueError("Transcription failed, so clips were not generated. Retry after fixing transcription.")
         clips = select_clips_for_video(
-            segments, duration=duration, ai_model=ai_model) if segments else []
+            segments,
+            duration=duration,
+            ai_model=ai_model,
+            audio_path=audio_path if audio_ok else None,
+            video_title=source_title or "",
+        )
         if not clips:
-            clips = fallback_clips(duration)
-            step(3, "done", f"Fallback — {len(clips)} evenly-spaced clips")
-        else:
-            avg_score = sum(int(c.get("virality_score", 0))
-                            for c in clips) // max(1, len(clips))
-            step(
-                3, "done", f"AI ranking — {len(clips)} clips selected, avg virality {avg_score}%")
-        clips = clips[:8]
+            step(3, "error", "AI clip selection failed. No fallback clips were generated; retry after fixing the AI response.")
+            raise ValueError("AI clip selection failed. No fallback clips were generated; retry after fixing the AI response.")
+        avg_score = sum(int(c.get("virality_score", 0))
+                        for c in clips) // max(1, len(clips))
+        step(
+            3, "done", f"AI ranking — {len(clips)} clips selected, avg virality {avg_score}%")
+        clips = clips[:12]
         ensure_not_cancelled(video_id)
 
         # ── Step 4: Export ────────────────────────────────────────────────────
@@ -2484,7 +2657,7 @@ async def cancel_video_route(video_id: int):
     request_video_cancel(video_id)
     cleanup_cancelled_video(
         video_id, source_started_as_download=video["status"] == "downloading")
-    return {"message": "Processing cancelled and progress discarded."}
+    return {"message": "Current generation cancelled. Existing completed shorts and source video were kept."}
 
 
 @app.get("/videos")

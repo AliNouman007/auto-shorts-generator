@@ -15,6 +15,8 @@ DEFAULT_PRESET_CONFIG = {
     "hard_max_clip_duration": 180,
     "allow_three_minute_shorts": False,
     "director_mode": "balanced",
+    "clip_output_mode": "shorts",
+    "genre_hint": "",
 }
 
 ENCODER_PRESETS = {
@@ -89,4 +91,7 @@ def normalize_preset_config(config=None):
     normalized["encoder_preset"] = encoder_preset if encoder_preset in ENCODER_PRESETS else "veryfast"
     director_mode = str(normalized.get("director_mode") or "balanced").lower()
     normalized["director_mode"] = director_mode if director_mode in {"balanced", "snappy", "story", "deep"} else "balanced"
+    clip_output_mode = str(normalized.get("clip_output_mode") or "shorts").lower()
+    normalized["clip_output_mode"] = clip_output_mode if clip_output_mode in {"shorts", "highlights"} else "shorts"
+    normalized["genre_hint"] = str(normalized.get("genre_hint") or "").strip()[:120]
     return normalized

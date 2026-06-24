@@ -173,6 +173,17 @@
             <span class="field-label">Blur Strength</span>
             <input id="preset-blur" class="field-input" type="number" min="0" max="80" value="{{ output_config.blur_strength | default(30) }}" />
           </label>
+          <label class="settings-field">
+            <span class="field-label">Clip Output</span>
+            <select id="preset-clip-output-mode" class="field-input">
+              <option value="shorts" {% if (output_config.clip_output_mode | default('shorts')) == 'shorts' %}selected{% endif %}>Shorts-safe (max 3 min)</option>
+              <option value="highlights" {% if output_config.clip_output_mode == 'highlights' %}selected{% endif %}>Long highlights (max 5 min)</option>
+            </select>
+          </label>
+          <label class="settings-field">
+            <span class="field-label">Genre Hint</span>
+            <input id="preset-genre-hint" class="field-input" type="text" maxlength="120" placeholder="funny stage show, podcast..." value="{{ output_config.genre_hint | default('') }}" />
+          </label>
         </div>
         <div class="settings-actions">
           <button class="btn btn-primary btn-sm" onclick="saveDefaultPreset(this)">Save Output Preset</button>

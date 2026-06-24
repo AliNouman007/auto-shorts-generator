@@ -115,6 +115,9 @@ async function saveDefaultPreset(btn) {
       document.getElementById("preset-blur")?.value || "30",
       10,
     ),
+    clip_output_mode:
+      document.getElementById("preset-clip-output-mode")?.value || "shorts",
+    genre_hint: document.getElementById("preset-genre-hint")?.value || "",
   };
 
   try {

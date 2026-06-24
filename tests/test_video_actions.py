@@ -100,6 +100,127 @@ class CaptionTranscriptionTest(unittest.TestCase):
         self.assertIn("Do not translate", prompt)
         self.assertNotIn("Roman English", prompt)
 
+    def test_large_groq_audio_uses_chunked_transcription(self):
+        async def run_test():
+            with (
+                mock.patch.object(main, "GROQ_API_KEY", "key"),
+                mock.patch.object(main, "should_chunk_groq_audio", return_value=True),
+                mock.patch.object(main, "split_audio_for_transcription", return_value=[
+                    {"path": "chunk_001.mp3", "offset": 0},
+                    {"path": "chunk_002.mp3", "offset": 600},
+                ]),
+                mock.patch.object(main, "transcribe_groq_audio_file") as transcribe_file,
+                mock.patch.object(main.Path, "unlink") as unlink,
+            ):
+                transcribe_file.side_effect = [
+                    [{"start": 1, "end": 3, "text": "first"}],
+                    [{"start": 2, "end": 5, "text": "second"}],
+                ]
+
+                segments = await main.transcribe_with_groq_api("large_audio.mp3")
+
+            self.assertEqual([
+                {"start": 1.0, "end": 3.0, "text": "first"},
+                {"start": 602.0, "end": 605.0, "text": "second"},
+            ], segments)
+            transcribe_file.assert_has_awaits([
+                mock.call("chunk_001.mp3"),
+                mock.call("chunk_002.mp3"),
+            ])
+            self.assertEqual(2, unlink.call_count)
+
+        import asyncio
+
+        asyncio.run(run_test())
+
+    def test_small_groq_audio_uses_direct_upload(self):
+        async def run_test():
+            with (
+                mock.patch.object(main, "GROQ_API_KEY", "key"),
+                mock.patch.object(main, "should_chunk_groq_audio", return_value=False),
+                mock.patch.object(main, "transcribe_groq_audio_file", return_value=[{"start": 0, "end": 4, "text": "small"}]) as transcribe_file,
+                mock.patch.object(main, "split_audio_for_transcription") as split_audio,
+            ):
+                segments = await main.transcribe_with_groq_api("small_audio.mp3")
+
+            self.assertEqual([{"start": 0, "end": 4, "text": "small"}], segments)
+            transcribe_file.assert_awaited_once_with("small_audio.mp3")
+            split_audio.assert_not_called()
+
+        import asyncio
+
+        asyncio.run(run_test())
+
+    def test_groq_direct_413_retries_with_chunking(self):
+        async def run_test():
+            with (
+                mock.patch.object(main, "GROQ_API_KEY", "key"),
+                mock.patch.object(main, "should_chunk_groq_audio", return_value=False),
+                mock.patch.object(main, "split_audio_for_transcription", return_value=[
+                    {"path": "retry_chunk.mp3", "offset": 30},
+                ]),
+                mock.patch.object(main.Path, "unlink"),
+                mock.patch.object(main, "transcribe_groq_audio_file") as transcribe_file,
+            ):
+                transcribe_file.side_effect = [
+                    main.GroqRequestTooLarge("Groq API error (413): Request Entity Too Large"),
+                    [{"start": 5, "end": 8, "text": "retry"}],
+                ]
+
+                segments = await main.transcribe_with_groq_api("too_big.mp3")
+
+            self.assertEqual([{"start": 35.0, "end": 38.0, "text": "retry"}], segments)
+            self.assertEqual(2, transcribe_file.await_count)
+
+        import asyncio
+
+        asyncio.run(run_test())
+
+    def test_groq_chunk_files_are_deleted_when_chunk_transcription_fails(self):
+        async def run_test():
+            with (
+                mock.patch.object(main, "split_audio_for_transcription", return_value=[
+                    {"path": "chunk_001.mp3", "offset": 0},
+                    {"path": "chunk_002.mp3", "offset": 600},
+                ]),
+                mock.patch.object(main.Path, "unlink") as unlink,
+                mock.patch.object(main, "transcribe_groq_audio_file", side_effect=RuntimeError("chunk failed")),
+            ):
+                with self.assertRaises(RuntimeError):
+                    await main.transcribe_groq_audio_chunks("source.mp3")
+
+            self.assertEqual(2, unlink.call_count)
+
+        import asyncio
+
+        asyncio.run(run_test())
+
+    def test_split_audio_for_transcription_builds_ffmpeg_chunks(self):
+        with (
+            mock.patch.object(main, "get_audio_duration", return_value=1250),
+            mock.patch.object(main, "run_command") as run_command,
+        ):
+            run_command.return_value.returncode = 0
+
+            chunks = main.split_audio_for_transcription("uploads/source_audio.mp3", chunk_seconds=600, video_id=77)
+
+        self.assertEqual([
+            {"path": "uploads/source_audio_chunk_001.mp3", "offset": 0.0},
+            {"path": "uploads/source_audio_chunk_002.mp3", "offset": 600.0},
+            {"path": "uploads/source_audio_chunk_003.mp3", "offset": 1200.0},
+        ], chunks)
+        first_command = run_command.call_args_list[0].args[0]
+        self.assertIn("-ss", first_command)
+        self.assertIn("-t", first_command)
+        self.assertEqual("600", first_command[first_command.index("-t") + 1])
+
+    def test_offset_transcription_segments_preserves_original_timing(self):
+        segments = [{"start": "2.5", "end": "6.25", "text": "chunk text"}]
+
+        shifted = main.offset_transcription_segments(segments, 600)
+
+        self.assertEqual([{"start": 602.5, "end": 606.25, "text": "chunk text"}], shifted)
+
 
 class CaptionFormattingTest(unittest.TestCase):
     def test_srt_wraps_long_caption_into_blocks_with_at_most_three_lines(self):
@@ -230,6 +351,172 @@ class ProcessingCaptionToggleTest(unittest.TestCase):
 
 
 class ClipSelectionTest(unittest.TestCase):
+    def test_audio_peaks_are_converted_to_candidate_moments(self):
+        from services.clip_director.audio import peaks_to_moments
+
+        segments = [
+            {"start": 90, "end": 115, "text": "The contestant starts setting up the joke."},
+            {"start": 115, "end": 150, "text": "The punchline lands and everyone starts laughing."},
+            {"start": 150, "end": 176, "text": "The judges react and the moment pays off."},
+        ]
+        peaks = [{"start": 126, "end": 130, "peak_time": 128, "energy": 0.95}]
+
+        moments = peaks_to_moments(peaks, segments, duration=240, mode="shorts")
+
+        self.assertEqual(1, len(moments))
+        self.assertLessEqual(moments[0]["start"], 90)
+        self.assertGreaterEqual(moments[0]["end"], 176)
+        self.assertTrue(moments[0]["has_audio_peak"])
+
+    def test_episode_map_includes_context_for_director(self):
+        from services.clip_director.episode_map import build_episode_map
+
+        episode = build_episode_map(
+            segments=[{"start": 0, "end": 12, "text": "A funny stage moment."}],
+            duration=600,
+            audio_peaks=[{"start": 4, "end": 7, "peak_time": 5, "energy": 0.8}],
+            title="India's Got Latent Season 2 Episode 1",
+            mode="highlights",
+            genre_hint="funny stage show",
+        )
+
+        self.assertEqual("highlights", episode["mode"])
+        self.assertEqual("funny stage show", episode["genre_hint"])
+        self.assertIn("India's Got Latent", episode["title"])
+        self.assertEqual(1, len(episode["audio_peaks"]))
+        self.assertEqual(1, len(episode["segments"]))
+
+    def test_llm_selection_accepts_variable_count_and_duration(self):
+        from services.clip_director.selection import select_dynamic_clips
+
+        segments = [
+            {"start": 0, "end": 80, "text": "The setup starts here and builds tension."},
+            {"start": 80, "end": 170, "text": "A funny payoff happens with audience laughter."},
+            {"start": 220, "end": 310, "text": "Another complete funny stage moment happens."},
+        ]
+
+        def fake_llm_selector(episode_map, constraints, ai_model):
+            return [
+                {"start": 0, "end": 170, "title": "Full Funny Setup", "reason": "Complete stage joke."},
+                {"start": 220, "end": 310, "title": "Second Big Laugh", "reason": "Another complete moment."},
+            ]
+
+        clips = select_dynamic_clips(
+            segments,
+            duration=400,
+            audio_peaks=[],
+            ai_model="gemini",
+            mode="shorts",
+            llm_selector=fake_llm_selector,
+        )
+
+        self.assertEqual(2, len(clips))
+        self.assertEqual(170, clips[0]["duration"])
+        self.assertEqual(90, clips[1]["duration"])
+
+    def test_shorts_mode_rejects_llm_clips_over_three_minutes(self):
+        from services.clip_director.selection import select_dynamic_clips
+
+        def fake_llm_selector(episode_map, constraints, ai_model):
+            return [{"start": 0, "end": 240, "title": "Too Long", "reason": "Too long for Shorts."}]
+
+        clips = select_dynamic_clips(
+            [{"start": 0, "end": 240, "text": "Long stage moment."}],
+            duration=300,
+            audio_peaks=[],
+            ai_model="gemini",
+            mode="shorts",
+            llm_selector=fake_llm_selector,
+        )
+
+        self.assertTrue(all(clip["duration"] <= 180 for clip in clips))
+
+    def test_highlights_mode_allows_five_minute_clips(self):
+        from services.clip_director.selection import select_dynamic_clips
+
+        def fake_llm_selector(episode_map, constraints, ai_model):
+            return [{"start": 0, "end": 300, "title": "Full Stage Bit", "reason": "Needs full setup and payoff."}]
+
+        clips = select_dynamic_clips(
+            [{"start": 0, "end": 300, "text": "A full five minute comedy bit."}],
+            duration=360,
+            audio_peaks=[],
+            ai_model="gemini",
+            mode="highlights",
+            llm_selector=fake_llm_selector,
+        )
+
+        self.assertEqual(1, len(clips))
+        self.assertEqual(300, clips[0]["duration"])
+
+    def test_dynamic_selection_falls_back_without_llm(self):
+        from services.clip_director.selection import select_dynamic_clips
+
+        segments = [
+            {"start": 0, "end": 45, "text": "A funny setup starts here."},
+            {"start": 45, "end": 95, "text": "The audience laughs at the payoff."},
+            {"start": 180, "end": 230, "text": "Another moment gets applause."},
+        ]
+
+        clips = select_dynamic_clips(
+            segments,
+            duration=260,
+            audio_peaks=[{"start": 50, "end": 55, "peak_time": 52, "energy": 0.9}],
+            ai_model="openai",
+            mode="shorts",
+            llm_selector=lambda *_args: [],
+        )
+
+        self.assertTrue(clips)
+        self.assertTrue(any(clip.get("has_audio_peak") for clip in clips))
+
+    def test_main_passes_audio_title_mode_and_genre_to_dynamic_director(self):
+        segments = [{"start": 0, "end": 120, "text": "A complete funny clip."}]
+        clip = {
+            "start": 0,
+            "end": 120,
+            "duration": 120,
+            "text": "A complete funny clip.",
+            "title": "Funny Clip",
+            "virality_score": 90,
+            "completion_score": 90,
+            "hook_type": "story",
+            "selection_reason": "Selected dynamically.",
+        }
+
+        with mock.patch.object(main.shorts_director, "select_dynamic_clips", return_value=[clip]) as selector:
+            clips = main.select_clips_for_video(
+                segments,
+                duration=300,
+                ai_model="gemini",
+                audio_path="uploads/unit_audio.mp3",
+                video_title="India's Got Latent Season 2 Episode 1",
+                preset={"clip_output_mode": "highlights", "genre_hint": "funny stage show"},
+            )
+
+        self.assertEqual([clip], clips)
+        self.assertEqual("uploads/unit_audio.mp3", selector.call_args.kwargs["audio_path"])
+        self.assertEqual("India's Got Latent Season 2 Episode 1", selector.call_args.kwargs["video_title"])
+        self.assertEqual("highlights", selector.call_args.kwargs["mode"])
+        self.assertEqual("funny stage show", selector.call_args.kwargs["genre_hint"])
+        self.assertFalse(selector.call_args.kwargs["allow_fallback"])
+
+    def test_complete_short_clip_keeps_source_as_one_clip(self):
+        segments = [
+            {"start": 0, "end": 12, "text": "Here is the hook."},
+            {"start": 12.5, "end": 58, "text": "Here is the payoff for the full short."},
+        ]
+
+        clips = shorts_director.complete_short_clip(segments, duration=58)
+
+        self.assertEqual(1, len(clips))
+        self.assertEqual(0, clips[0]["start"])
+        self.assertEqual(58, clips[0]["end"])
+        self.assertEqual("Complete short", clips[0]["title"])
+        self.assertEqual("complete_short", clips[0]["hook_type"])
+        self.assertIn("Here is the hook.", clips[0]["text"])
+        self.assertIn("not being split", clips[0]["selection_reason"])
+
     def test_director_prompt_requires_hcvp_json_metadata(self):
         candidates = [{
             "candidate_id": 1,
@@ -437,8 +724,8 @@ class VideoActionsTest(unittest.TestCase):
         video = main.db_read("SELECT status FROM videos WHERE id=?", (self.video_id,))[0]
         self.assertEqual("waiting", video["status"])
 
-    def test_cleanup_cancelled_video_removes_generated_files_and_resets_status(self):
-        self._create_short("unit_cancel_short.mp4")
+    def test_cleanup_cancelled_video_keeps_existing_shorts_and_resets_status(self):
+        short_id = self._create_short("unit_cancel_short.mp4")
         (main.OUTPUTS_DIR / "unit_cancel_short.srt").write_text("subtitle")
 
         main.cleanup_cancelled_video(self.video_id, source_started_as_download=False)
@@ -446,9 +733,11 @@ class VideoActionsTest(unittest.TestCase):
         video = main.db_read("SELECT status, steps_json FROM videos WHERE id=?", (self.video_id,))[0]
         self.assertEqual("waiting", video["status"])
         self.assertIn("Cancelled", video["steps_json"])
-        self.assertEqual([], main.db_read("SELECT id FROM shorts WHERE video_id=?", (self.video_id,)))
-        self.assertFalse((main.OUTPUTS_DIR / "unit_cancel_short.mp4").exists())
-        self.assertFalse((main.OUTPUTS_DIR / "unit_cancel_short.srt").exists())
+        self.assertEqual([short_id], [
+            row["id"] for row in main.db_read("SELECT id FROM shorts WHERE video_id=?", (self.video_id,))
+        ])
+        self.assertTrue((main.OUTPUTS_DIR / "unit_cancel_short.mp4").exists())
+        self.assertTrue((main.OUTPUTS_DIR / "unit_cancel_short.srt").exists())
 
     def test_cleanup_cancelled_video_removes_partial_output_without_database_row(self):
         partial = main.OUTPUTS_DIR / "test_cancel_video_short_99.mp4"
@@ -457,6 +746,14 @@ class VideoActionsTest(unittest.TestCase):
         main.cleanup_cancelled_video(self.video_id, source_started_as_download=False)
 
         self.assertFalse(partial.exists())
+
+    def test_cleanup_cancelled_download_keeps_downloaded_source_when_present(self):
+        main.cleanup_cancelled_video(self.video_id, source_started_as_download=True)
+
+        video = main.db_read("SELECT status, source_path FROM videos WHERE id=?", (self.video_id,))[0]
+        self.assertEqual("waiting", video["status"])
+        self.assertEqual(str(self.source_path), video["source_path"])
+        self.assertTrue(self.source_path.exists())
 
     def test_delete_source_video_removes_downloaded_file_and_resets_video(self):
         self._create_short("unit_cancel_short.mp4")
@@ -501,6 +798,27 @@ class VideoActionsTest(unittest.TestCase):
         video = main.db_read("SELECT status, error_message FROM videos WHERE id=?", (self.video_id,))[0]
         self.assertEqual("completed", video["status"])
         self.assertIsNone(video["error_message"])
+
+    def test_processing_fails_instead_of_fallback_when_ai_selects_no_clips(self):
+        segment = {"start": 0, "end": 10, "text": "Transcript exists."}
+
+        with (
+            mock.patch.object(main, "missing_tools_message", return_value=""),
+            mock.patch.object(main, "is_valid_video", return_value=True),
+            mock.patch.object(main, "get_video_duration", return_value=120),
+            mock.patch.object(main, "extract_audio", return_value=True),
+            mock.patch.object(main, "transcribe_with_whisper_local", return_value=[segment]),
+            mock.patch.object(main, "select_clips_for_video", return_value=[]),
+            mock.patch.object(main, "fallback_clips") as fallback_clips,
+            mock.patch.object(main, "export_short_clip") as export_short_clip,
+        ):
+            main._process_video_sync(self.video_id, str(self.source_path), captions_enabled=False)
+
+        video = main.db_read("SELECT status, error_message FROM videos WHERE id=?", (self.video_id,))[0]
+        self.assertEqual("failed", video["status"])
+        self.assertIn("AI clip selection failed", video["error_message"])
+        fallback_clips.assert_not_called()
+        export_short_clip.assert_not_called()
 
 class DashboardRenderingTest(unittest.TestCase):
     def test_waiting_video_shows_generate_without_download_generate(self):
