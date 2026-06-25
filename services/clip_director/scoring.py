@@ -1,5 +1,7 @@
 import re
 
+from .episode_intelligence import episode_context_score
+
 
 HOOK_WORDS = {
     "why", "how", "what", "mistake", "secret", "surprising", "nobody", "never",
@@ -15,6 +17,11 @@ REACTION_WORDS = {
     "laugh", "laughing", "laughter", "applause", "wow", "shocked", "react",
     "reaction", "reacts", "crowd", "judge", "judges", "audience", "taali",
     "hasna", "hassi", "roast", "punchline",
+}
+PERFORMANCE_WORDS = {
+    "dance", "dancing", "performance", "perform", "performed", "sing",
+    "singing", "song", "act", "stage", "rap", "beatbox", "magic",
+    "mimicry", "impression",
 }
 
 
@@ -47,15 +54,23 @@ def score_candidate(candidate: dict) -> dict:
     payoff = clamp(_word_hits(text, PAYOFF_WORDS) / 3)
     audio_reaction = clamp(float(candidate.get("audio_peak_energy", 0)) + (_word_hits(text, REACTION_WORDS) / 4))
     standalone = clamp((len(words) / 55) + (0.25 if payoff > 0 else 0))
-    visual = 0.55 if candidate.get("candidate_source") in {"scene_topic", "audio_peak"} else 0.35
+    source = str(candidate.get("candidate_source", ""))
+    visual = 0.55 if source in {"scene_topic", "audio_peak"} else 0.35
+    if source == "performance_moment" or _word_hits(text, PERFORMANCE_WORDS) > 0:
+        visual = max(visual, 0.75)
     duration_component = _duration_score(duration)
-    is_comedy = candidate.get("candidate_source") in {"audio_peak", "comedy"} or _word_hits(text, REACTION_WORDS) > 0
+    episode_context, episode_hits = episode_context_score(
+        text,
+        candidate.get("episode_profile"),
+        source,
+    )
+    is_comedy = source in {"audio_peak", "comedy", "performance_moment"} or _word_hits(text, REACTION_WORDS) > 0
     if is_comedy:
         hook = max(hook, clamp(_word_hits(text, HOOK_WORDS) / 2))
         payoff = max(payoff, clamp(_word_hits(text, PAYOFF_WORDS) / 2))
         audio_reaction = max(audio_reaction, clamp(float(candidate.get("audio_peak_energy", 0)) * 0.85 + (_word_hits(text, REACTION_WORDS) / 5)))
         standalone = max(standalone, 0.7 if len(words) >= 12 else standalone)
-        visual = max(visual, 0.65)
+        visual = max(visual, 0.75 if source == "performance_moment" else 0.65)
     features = {
         "hook": hook,
         "payoff": payoff,
@@ -63,6 +78,7 @@ def score_candidate(candidate: dict) -> dict:
         "standalone": standalone,
         "visual": visual,
         "duration": duration_component,
+        "episodeContext": episode_context,
     }
     penalties = {
         "midSentenceStart": 1.0 if candidate.get("mid_sentence_start") else 0.0,
@@ -81,6 +97,7 @@ def score_candidate(candidate: dict) -> dict:
         + 0.16 * features["standalone"]
         + 0.10 * features["visual"]
         + 0.08 * features["duration"]
+        + 0.14 * features["episodeContext"]
     )
     penalty = (
         0.10 * penalties["midSentenceStart"]
@@ -101,4 +118,5 @@ def score_candidate(candidate: dict) -> dict:
         "base_score": round(base_score, 4),
         "penalty": round(penalty, 4),
         "final_score": round(final_score, 4),
+        "episode_context_hits": sorted(set((candidate.get("episode_context_hits") or []) + episode_hits)),
     }

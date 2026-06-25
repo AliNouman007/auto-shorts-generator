@@ -34,6 +34,8 @@ class CandidateMoment(TypedDict, total=False):
     penalty: float
     final_score: float
     boundary_notes: list[str]
+    episode_profile: dict
+    episode_context_hits: list[str]
 
 
 class EpisodeMap(TypedDict, total=False):
@@ -46,6 +48,7 @@ class EpisodeMap(TypedDict, total=False):
     audio_peaks: list[AudioPeak]
     candidate_moments: list[CandidateMoment]
     shortlisted_candidates: list[CandidateMoment]
+    episode_profile: dict
 
 
 class ClipConstraints(TypedDict):

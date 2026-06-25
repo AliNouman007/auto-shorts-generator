@@ -72,7 +72,7 @@ class YoutubeDownloadCommandTest(unittest.TestCase):
 
 
 class CaptionTranscriptionTest(unittest.TestCase):
-    def test_local_whisper_transcribes_without_forcing_language_or_translation(self):
+    def test_local_whisper_transcribes_with_hindi_language_hint_without_translation(self):
         with mock.patch.object(main, "run_command") as run_command:
             run_command.return_value.returncode = 1
 
@@ -82,15 +82,27 @@ class CaptionTranscriptionTest(unittest.TestCase):
         self.assertIn("--task", command)
         self.assertIn("transcribe", command)
         self.assertNotIn("translate", command)
-        self.assertNotIn("--language", command)
+        self.assertIn("--language", command)
+        self.assertEqual("hi", command[command.index("--language") + 1])
+        self.assertNotIn("--initial_prompt", command)
 
-    def test_api_transcription_data_does_not_force_language_or_romanization(self):
+    def test_api_transcription_data_uses_language_hint_and_word_timestamps_without_prompt(self):
         data = main.build_whisper_transcription_data("whisper-1")
+
+        self.assertEqual("whisper-1", data["model"])
+        self.assertEqual("verbose_json", data["response_format"])
+        self.assertEqual("hi", data["language"])
+        self.assertEqual(["word", "segment"], data["timestamp_granularities[]"])
+        self.assertNotIn("prompt", data)
+
+    def test_api_transcription_data_can_keep_raw_original_text(self):
+        data = main.build_whisper_transcription_data("whisper-1", caption_mode="original")
 
         self.assertEqual("whisper-1", data["model"])
         self.assertEqual("verbose_json", data["response_format"])
         self.assertNotIn("language", data)
         self.assertNotIn("prompt", data)
+        self.assertEqual(["word", "segment"], data["timestamp_granularities[]"])
 
     def test_gemini_prompt_requests_accurate_transcription_without_translation(self):
         prompt = main.build_gemini_transcription_prompt()
@@ -98,7 +110,7 @@ class CaptionTranscriptionTest(unittest.TestCase):
         self.assertIn("Transcribe", prompt)
         self.assertIn("preserve the speaker's original words", prompt)
         self.assertIn("Do not translate", prompt)
-        self.assertNotIn("Roman English", prompt)
+        self.assertIn("Roman Hinglish", prompt)
 
     def test_large_groq_audio_uses_chunked_transcription(self):
         async def run_test():
@@ -221,6 +233,54 @@ class CaptionTranscriptionTest(unittest.TestCase):
 
         self.assertEqual([{"start": 602.5, "end": 606.25, "text": "chunk text"}], shifted)
 
+    def test_offset_transcription_segments_offsets_nested_word_timestamps(self):
+        segments = [{
+            "start": 2,
+            "end": 5,
+            "text": "kaise ho",
+            "words": [
+                {"start": 2.1, "end": 2.6, "word": "kaise"},
+                {"start": 2.7, "end": 3.0, "word": "ho"},
+            ],
+        }]
+
+        shifted = main.offset_transcription_segments(segments, 600)
+
+        self.assertEqual(602.1, shifted[0]["words"][0]["start"])
+        self.assertEqual(603.0, shifted[0]["words"][1]["end"])
+
+    def test_transcription_response_attaches_top_level_words_to_segments(self):
+        payload = {
+            "segments": [
+                {"start": 0, "end": 2, "text": "kaise ho"},
+                {"start": 2, "end": 4, "text": "sab theek"},
+            ],
+            "words": [
+                {"start": 0.2, "end": 0.6, "word": "kaise"},
+                {"start": 0.7, "end": 1.0, "word": "ho"},
+                {"start": 2.2, "end": 2.6, "word": "sab"},
+            ],
+        }
+
+        segments = main.segments_from_transcription_response(payload)
+
+        self.assertEqual(2, len(segments))
+        self.assertEqual(["kaise", "ho"], [word["word"] for word in segments[0]["words"]])
+        self.assertEqual(["sab"], [word["word"] for word in segments[1]["words"]])
+
+    def test_transcription_response_removes_instruction_leak_segments(self):
+        payload = {
+            "segments": [
+                {"start": 0, "end": 2, "text": "kaise ho"},
+                {"start": 2, "end": 4, "text": "Do not translate the meaning into English."},
+            ]
+        }
+
+        segments = main.segments_from_transcription_response(payload)
+
+        self.assertEqual(1, len(segments))
+        self.assertEqual("kaise ho", segments[0]["text"])
+
 
 class CaptionFormattingTest(unittest.TestCase):
     def test_srt_wraps_long_caption_into_blocks_with_at_most_three_lines(self):
@@ -247,7 +307,7 @@ class CaptionFormattingTest(unittest.TestCase):
         self.assertTrue(main.captions_enabled_from_body({"captions_enabled": True}))
         self.assertFalse(main.captions_enabled_from_body({"captions_enabled": False}))
 
-    def test_srt_preserves_transcribed_script_before_wrapping(self):
+    def test_srt_defaults_to_hinglish_romanized_captions(self):
         segments = [
             {"start": 0, "end": 2, "text": "तुम कैसे हो"},
             {"start": 2, "end": 4, "text": "تم کیسے ہو"},
@@ -255,11 +315,121 @@ class CaptionFormattingTest(unittest.TestCase):
 
         srt = main.generate_srt(segments, 0, 4)
 
+        self.assertIn("tum kaise ho", srt)
+        self.assertNotIn("तुम कैसे हो", srt)
+        self.assertNotIn("تم کیسے ہو", srt)
+
+    def test_srt_can_preserve_original_script_when_requested(self):
+        segments = [
+            {"start": 0, "end": 2, "text": "तुम कैसे हो"},
+            {"start": 2, "end": 4, "text": "تم کیسے ہو"},
+        ]
+
+        srt = main.generate_srt(segments, 0, 4, caption_mode="original")
+
         self.assertIn("तुम कैसे हो", srt)
         self.assertIn("تم کیسے ہو", srt)
 
+    def test_srt_splits_long_segment_into_short_timed_caption_units(self):
+        segments = [{
+            "start": 0,
+            "end": 9,
+            "text": "ye joke bohat funny tha audience hassi aur judge react karta hai",
+        }]
+
+        srt = main.generate_srt(segments, 0, 9)
+
+        entries = [entry.splitlines() for entry in srt.split("\n\n") if entry.strip()]
+        self.assertGreater(len(entries), 1)
+        for entry in entries:
+            start_text, end_text = entry[1].split(" --> ")
+            start_seconds = main.srt_time_to_seconds(start_text)
+            end_seconds = main.srt_time_to_seconds(end_text)
+            self.assertLessEqual(end_seconds - start_seconds, 2.8)
+
+    def test_srt_prefers_word_timestamps_when_available(self):
+        segments = [{
+            "start": 0,
+            "end": 8,
+            "text": "kaise ho audience hassi",
+            "words": [
+                {"start": 1.2, "end": 1.5, "word": "kaise"},
+                {"start": 1.6, "end": 1.9, "word": "ho"},
+                {"start": 4.1, "end": 4.6, "word": "audience"},
+                {"start": 4.7, "end": 5.1, "word": "hassi"},
+            ],
+        }]
+
+        srt = main.generate_srt(segments, 0, 8)
+
+        entries = [entry.splitlines() for entry in srt.split("\n\n") if entry.strip()]
+        first_start = main.srt_time_to_seconds(entries[0][1].split(" --> ")[0])
+        self.assertAlmostEqual(1.2, first_start, places=1)
+        self.assertIn("kaise ho", "\n".join(entries[0][2:]))
+        self.assertIn("audience hassi", "\n".join(entries[1][2:]))
+
+    def test_srt_skips_transcription_instruction_leaks(self):
+        segments = [
+            {"start": 0, "end": 2, "text": "kaise ho"},
+            {"start": 2, "end": 4, "text": "Do not translate the meaning into English."},
+        ]
+
+        srt = main.generate_srt(segments, 0, 4)
+
+        self.assertIn("kaise ho", srt)
+        self.assertNotIn("Do not translate", srt)
+
 
 class ProcessingCaptionToggleTest(unittest.TestCase):
+    def test_processing_exports_every_clip_selected_by_v2(self):
+        source_path = main.UPLOADS_DIR / "unit_many_v2_clips.mp4"
+        source_path.write_text("source")
+        main.db_write(
+            "INSERT INTO videos (youtube_video_id, title, source_path, status) VALUES (?,?,?,'waiting')",
+            ("unit_many_v2_clips", "Many V2 clips", str(source_path)),
+        )
+        video_id = main.db_read(
+            "SELECT id FROM videos WHERE youtube_video_id=?",
+            ("unit_many_v2_clips",),
+        )[0]["id"]
+        self.addCleanup(lambda: main.db_write("DELETE FROM shorts WHERE video_id=?", (video_id,)))
+        self.addCleanup(lambda: main.db_write("DELETE FROM videos WHERE id=?", (video_id,)))
+        self.addCleanup(lambda: source_path.unlink(missing_ok=True))
+
+        clips = [
+            {
+                "start": idx * 40,
+                "end": idx * 40 + 30,
+                "duration": 30,
+                "text": f"Funny selected clip {idx}",
+                "title": f"Clip {idx}",
+                "virality_score": 60,
+                "completion_score": 75,
+                "hook_type": "comedy",
+                "selection_reason": "Selected by V2.",
+                "timestamp_engine": "v2",
+                "candidate_source": "comedy",
+                "final_score": 0.5,
+                "score_details_json": "{}",
+                "judge_status": "deterministic_rescue",
+            }
+            for idx in range(24)
+        ]
+
+        with (
+            mock.patch.object(main, "missing_tools_message", return_value=""),
+            mock.patch.object(main, "is_valid_video", return_value=True),
+            mock.patch.object(main, "get_video_duration", return_value=3600),
+            mock.patch.object(main, "extract_audio", return_value=True),
+            mock.patch.object(main, "transcribe_with_whisper_local", return_value=[clips[0]]),
+            mock.patch.object(main, "select_clips_for_video", return_value=clips),
+            mock.patch.object(main, "export_short_clip", return_value=True) as export_short_clip,
+        ):
+            main._process_video_sync(video_id, str(source_path), captions_enabled=False)
+
+        self.assertEqual(24, export_short_clip.call_count)
+        self.assertEqual(24, main.db_read("SELECT COUNT(*) AS count FROM shorts WHERE video_id=?", (video_id,))[0]["count"])
+
     def test_processing_with_captions_disabled_exports_without_srt_file(self):
         source_path = main.UPLOADS_DIR / "unit_no_captions.mp4"
         source_path.write_text("source")
@@ -396,6 +566,165 @@ class ProcessingCaptionToggleTest(unittest.TestCase):
 
 
 class ClipSelectionTest(unittest.TestCase):
+    def test_episode_profile_fallback_extracts_dynamic_people_from_title(self):
+        from services.clip_director.episode_intelligence import build_fallback_episode_profile
+
+        profile = build_fallback_episode_profile(
+            "INDIA’S GOT LATENT S2 EP1 ft. Alia Bhatt, Sharvari, Ashish Solanki",
+            [],
+            genre_hint="funny stage show",
+        )
+
+        names = [entity["name"] for entity in profile["important_entities"]]
+        self.assertIn("Alia Bhatt", names)
+        self.assertIn("Sharvari", names)
+        self.assertIn("Ashish Solanki", names)
+        self.assertEqual("comedy panel show", profile["show_type"])
+
+    def test_episode_context_candidates_are_created_from_dynamic_entities(self):
+        from services.clip_director.candidates import generate_candidates
+        from services.clip_director.timeline import build_timeline
+
+        timeline = build_timeline(
+            [
+                {"start": 0, "end": 20, "text": "Contestant starts normal setup."},
+                {"start": 20, "end": 45, "text": "Then he roasts Alia and the audience starts laughing."},
+                {"start": 45, "end": 72, "text": "Judges react and the punchline payoff continues."},
+            ],
+            duration=120,
+        )
+        profile = {
+            "important_entities": [{"name": "Alia Bhatt", "aliases": ["alia"]}],
+            "viral_moment_patterns": ["celebrity roast", "judge reaction"],
+        }
+
+        candidates = generate_candidates(
+            timeline,
+            {"min_duration": 30, "max_duration": 180},
+            episode_profile=profile,
+        )
+
+        contextual = [candidate for candidate in candidates if candidate["candidate_source"] == "episode_context"]
+        self.assertTrue(contextual)
+        self.assertIn("Alia Bhatt", contextual[0]["episode_context_hits"])
+
+    def test_comedy_reaction_candidate_expands_back_to_full_joke_setup(self):
+        from services.clip_director.candidates import generate_candidates
+        from services.clip_director.timeline import build_timeline
+
+        timeline = build_timeline(
+            [
+                {"start": 0, "end": 8, "text": "Contestant starts the setup for the joke."},
+                {"start": 8.2, "end": 18, "text": "He builds the story before the punchline."},
+                {"start": 18.2, "end": 28, "text": "The punchline lands on the judges."},
+                {"start": 28.2, "end": 36, "text": "Audience laughing applause gets loud."},
+            ],
+            duration=90,
+        )
+
+        candidates = generate_candidates(
+            timeline,
+            {"min_duration": 30, "max_duration": 180},
+        )
+
+        comedy_candidates = [
+            candidate for candidate in candidates
+            if candidate["candidate_source"] == "comedy"
+        ]
+        self.assertTrue(comedy_candidates)
+        self.assertLessEqual(comedy_candidates[0]["start"], 0.1)
+        self.assertGreaterEqual(comedy_candidates[0]["end"], 36)
+
+    def test_performance_candidates_are_created_for_dance_and_stage_reactions(self):
+        from services.clip_director.candidates import generate_candidates
+        from services.clip_director.timeline import build_timeline
+
+        timeline = build_timeline(
+            [
+                {"start": 0, "end": 12, "text": "Contestant starts a dance performance on stage."},
+                {"start": 12.2, "end": 25, "text": "The judge cracks a joke during the act."},
+                {"start": 25.2, "end": 42, "text": "Crowd applause and laughing reaction make the moment bigger."},
+            ],
+            duration=120,
+        )
+
+        candidates = generate_candidates(
+            timeline,
+            {"min_duration": 30, "max_duration": 180},
+        )
+
+        performance_candidates = [
+            candidate for candidate in candidates
+            if candidate["candidate_source"] == "performance_moment"
+        ]
+        self.assertTrue(performance_candidates)
+        self.assertIn("dance performance", performance_candidates[0]["text"].lower())
+
+    def test_episode_context_boost_rewards_entity_with_reaction_more_than_name_only(self):
+        from services.clip_director.scoring import score_candidate
+
+        profile = {
+            "important_entities": [{"name": "Alia Bhatt", "aliases": ["alia"]}],
+            "viral_moment_patterns": ["celebrity roast"],
+        }
+        name_only = {
+            "candidate_id": "name",
+            "candidate_source": "episode_context",
+            "start": 0,
+            "end": 50,
+            "duration": 50,
+            "text": "Alia is sitting there and the conversation continues.",
+            "episode_profile": profile,
+            "episode_context_hits": ["Alia Bhatt"],
+        }
+        with_reaction = {
+            **name_only,
+            "candidate_id": "reaction",
+            "text": "Alia gets roasted in the joke and the audience laughing applause follows the punchline.",
+        }
+
+        name_score = score_candidate(name_only)
+        reaction_score = score_candidate(with_reaction)
+
+        self.assertGreater(reaction_score["feature_scores"]["episodeContext"], name_score["feature_scores"]["episodeContext"])
+        self.assertGreater(reaction_score["final_score"], name_score["final_score"])
+
+    def test_visual_performance_score_rewards_stage_actions_with_reaction(self):
+        from services.clip_director.scoring import score_candidate
+
+        performance = score_candidate({
+            "candidate_id": "dance",
+            "candidate_source": "performance_moment",
+            "start": 0,
+            "end": 42,
+            "duration": 42,
+            "text": "Contestant dance performance gets crowd applause and judge reaction.",
+        })
+
+        self.assertGreaterEqual(performance["feature_scores"]["visual"], 0.75)
+        self.assertGreater(performance["final_score"], 0.45)
+
+    def test_director_prompt_includes_episode_profile_for_judge(self):
+        from services.clip_director.prompts import build_director_prompt
+
+        prompt = build_director_prompt(
+            {
+                "title": "Comedy episode",
+                "duration": 600,
+                "mode": "shorts",
+                "episode_profile": {
+                    "show_type": "comedy panel show",
+                    "important_entities": [{"name": "Dynamic Guest", "aliases": ["guest"]}],
+                    "viral_moment_patterns": ["guest roast"],
+                },
+                "shortlisted_candidates": [{"candidate_id": "v2-1", "start": 0, "end": 60, "text": "guest roast"}],
+            },
+            {"mode": "shorts", "min_duration": 30, "max_duration": 180, "safety_max_clips": 30},
+        )
+
+        self.assertIn("episode_profile", prompt)
+        self.assertIn("Dynamic Guest", prompt)
+
     def test_v2_pipeline_scores_snaps_dedupes_and_requires_llm_judge(self):
         from services.clip_director.selection import select_dynamic_clips
 
@@ -515,14 +844,36 @@ class ClipSelectionTest(unittest.TestCase):
         self.assertGreater(strong_score, weak_score)
         self.assertGreater(strong_score, 0.6)
 
-    def test_v2_comedy_minimum_clip_targets_by_video_length(self):
-        from services.clip_director.selection import target_v2_clip_count
+    def test_v2_selection_cap_allows_up_to_thirty_qualified_clips(self):
+        from services.clip_director.selection import constraints_for_mode
 
-        self.assertEqual(3, target_v2_clip_count(10 * 60))
-        self.assertEqual(3, target_v2_clip_count(20 * 60))
-        self.assertEqual(6, target_v2_clip_count(21 * 60))
-        self.assertEqual(6, target_v2_clip_count(45 * 60))
-        self.assertEqual(10, target_v2_clip_count(59 * 60))
+        self.assertEqual(30, constraints_for_mode("shorts")["safety_max_clips"])
+
+    def test_v2_exports_all_qualified_deterministic_clips_instead_of_duration_target(self):
+        from services.clip_director.selection import select_dynamic_clips
+
+        segments = []
+        peaks = []
+        for idx, start in enumerate([0, 90, 180, 270]):
+            segments.extend([
+                {"start": start, "end": start + 10, "text": f"Why does mistake {idx} hurt retention?"},
+                {"start": start + 10.2, "end": start + 35, "text": "Because the hook hides the answer and viewers leave."},
+                {"start": start + 35.2, "end": start + 58, "text": "Here is the fix, result, and payoff that makes it work."},
+            ])
+            peaks.append({"start": start + 18, "end": start + 24, "peak_time": start + 21, "energy": 0.95})
+
+        clips = select_dynamic_clips(
+            segments,
+            duration=420,
+            audio_peaks=peaks,
+            llm_selector=None,
+            allow_fallback=False,
+            use_v2=True,
+        )
+
+        self.assertEqual(4, len(clips))
+        self.assertTrue(all(clip["final_score"] >= 0.45 for clip in clips))
+        self.assertTrue(all(clip["judge_status"] == "deterministic_fill" for clip in clips))
 
     def test_v2_comedy_scoring_prefers_laughter_applause_and_hinglish_jokes(self):
         from services.clip_director.scoring import score_candidate
@@ -588,17 +939,46 @@ class ClipSelectionTest(unittest.TestCase):
         )
 
         self.assertGreaterEqual(len(clips), 8)
-        self.assertLessEqual(len(clips), 12)
+        self.assertLessEqual(len(clips), 30)
         self.assertTrue(all(clip["final_score"] >= 0.45 for clip in clips))
         self.assertTrue(any(clip["judge_status"] == "deterministic_fill" for clip in clips))
-        self.assertTrue(all(clip["candidate_source"] in {"audio_peak", "comedy"} for clip in clips))
+        self.assertTrue(all(clip["candidate_source"] in {"audio_peak", "comedy", "episode_context"} for clip in clips))
+
+    def test_v2_long_comedy_tops_up_with_rescue_when_only_few_candidates_clear_score_floor(self):
+        from services.clip_director.selection import select_dynamic_clips
+
+        segments = []
+        for idx in range(80):
+            start = idx * 42
+            if idx in {4, 28}:
+                text = "Why does this joke work? The setup, punchline, audience laughing applause, and payoff are all clear."
+            else:
+                text = "foreign"
+            segments.append({"start": start, "end": start + 18, "text": text})
+
+        clips = select_dynamic_clips(
+            segments,
+            duration=3560,
+            audio_peaks=[],
+            video_title="INDIA’S GOT LATENT S2 EP1",
+            genre_hint="funny stage show",
+            llm_selector=None,
+            allow_fallback=False,
+            use_v2=True,
+        )
+
+        self.assertGreaterEqual(len(clips), 20)
+        self.assertLessEqual(len(clips), 30)
+        self.assertTrue(any(clip["final_score"] >= 0.45 for clip in clips))
+        self.assertTrue(any(clip["final_score"] < 0.45 for clip in clips))
+        self.assertTrue(any(clip["judge_status"] == "deterministic_rescue" for clip in clips))
 
     def test_v2_judge_is_called_again_when_first_batch_returns_too_few_clips(self):
         from services.clip_director.selection import select_dynamic_clips
 
         segments = []
         peaks = []
-        for idx in range(8):
+        for idx in range(16):
             start = 30 + idx * 180
             segments.extend([
                 {"start": start, "end": start + 10, "text": f"Funny setup {idx} with comedy roast."},
@@ -622,7 +1002,7 @@ class ClipSelectionTest(unittest.TestCase):
 
         clips = select_dynamic_clips(
             segments,
-            duration=30 * 60,
+            duration=50 * 60,
             audio_peaks=peaks,
             genre_hint="comedy",
             llm_selector=sparse_judge,

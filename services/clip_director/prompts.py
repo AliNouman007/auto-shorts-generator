@@ -12,6 +12,7 @@ def build_director_prompt(episode_map: EpisodeMap, constraints: ClipConstraints)
             "mode": episode_map.get("mode", "shorts"),
             "genre_hint": episode_map.get("genre_hint", ""),
             "detected_genre": episode_map.get("detected_genre", "auto"),
+            "episode_profile": episode_map.get("episode_profile", {}),
             "constraints": constraints,
             "shortlisted_candidates": shortlisted[:40],
         }
@@ -34,6 +35,7 @@ def build_director_prompt(episode_map: EpisodeMap, constraints: ClipConstraints)
         "mode": episode_map.get("mode", "shorts"),
         "genre_hint": episode_map.get("genre_hint", ""),
         "detected_genre": episode_map.get("detected_genre", "auto"),
+        "episode_profile": episode_map.get("episode_profile", {}),
         "constraints": constraints,
         "audio_peaks": episode_map.get("audio_peaks", [])[:40],
         "candidate_moments": episode_map.get("candidate_moments", [])[:30],

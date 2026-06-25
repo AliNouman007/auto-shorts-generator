@@ -1,9 +1,15 @@
 from .timeline import segments_between, text_between
+from .episode_intelligence import context_hits_for_text
 
 
 HOOK_TERMS = ("why", "how", "what", "mistake", "secret", "surprising", "problem", "stop", "fix", "setup", "roast", "joke")
 QUOTE_TERMS = ("best", "truth", "remember", "important", "change", "result", "lesson")
 COMEDY_TERMS = ("laugh", "laughing", "laughter", "joke", "funny", "audience", "judge", "judges", "applause", "punchline", "roast", "samay", "taali", "hassi")
+PERFORMANCE_TERMS = (
+    "dance", "dancing", "performance", "perform", "performed", "sing",
+    "singing", "song", "act", "stage", "rap", "beatbox", "magic",
+    "mimicry", "impression",
+)
 
 
 def _candidate(candidate_id: str, source: str, start: float, end: float, timeline: dict, **extra) -> dict:
@@ -17,7 +23,13 @@ def _candidate(candidate_id: str, source: str, start: float, end: float, timelin
     }
 
 
-def generate_candidates(timeline: dict, constraints: dict, limit: int = 300) -> list[dict]:
+def _expanded_candidate_indexes(source: str, idx: int, segments: list[dict]) -> tuple[int, int]:
+    if source in {"comedy", "performance_moment"}:
+        return max(0, idx - 3), min(len(segments) - 1, idx + 3)
+    return max(0, idx - 1), min(len(segments) - 1, idx + 2)
+
+
+def generate_candidates(timeline: dict, constraints: dict, limit: int = 300, episode_profile: dict | None = None) -> list[dict]:
     segments = timeline.get("segments", [])
     duration = float(timeline.get("duration", 0))
     candidates: list[dict] = []
@@ -39,7 +51,9 @@ def generate_candidates(timeline: dict, constraints: dict, limit: int = 300) -> 
     for idx, segment in enumerate(segments):
         text = str(segment.get("text", "")).lower()
         source = ""
-        if any(term in text for term in COMEDY_TERMS):
+        if any(term in text for term in PERFORMANCE_TERMS):
+            source = "performance_moment"
+        elif any(term in text for term in COMEDY_TERMS):
             source = "comedy"
         elif any(term in text for term in HOOK_TERMS):
             source = "qa" if "?" in str(segment.get("text", "")) or text.startswith(("why", "how", "what")) else "transcript_hook"
@@ -47,12 +61,39 @@ def generate_candidates(timeline: dict, constraints: dict, limit: int = 300) -> 
             source = "quote_value"
         if not source:
             continue
-        start_idx = max(0, idx - 1)
-        end_idx = min(len(segments) - 1, idx + 2)
+        start_idx, end_idx = _expanded_candidate_indexes(source, idx, segments)
         start = float(segments[start_idx].get("start", segment.get("start", 0)))
         end = float(segments[end_idx].get("end", segment.get("end", start)))
-        candidates.append(_candidate(f"v2-{counter}", source, start, end, timeline))
+        candidates.append(_candidate(
+            f"v2-{counter}",
+            source,
+            start,
+            end,
+            timeline,
+            completeness_expanded=source in {"comedy", "performance_moment"},
+        ))
         counter += 1
+
+    if episode_profile:
+        for idx, segment in enumerate(segments):
+            text = str(segment.get("text", ""))
+            hits = context_hits_for_text(text, episode_profile)
+            if not hits:
+                continue
+            start_idx = max(0, idx - 2)
+            end_idx = min(len(segments) - 1, idx + 4)
+            start = float(segments[start_idx].get("start", segment.get("start", 0)))
+            end = float(segments[end_idx].get("end", segment.get("end", start)))
+            candidates.append(_candidate(
+                f"v2-{counter}",
+                "episode_context",
+                start,
+                end,
+                timeline,
+                episode_profile=episode_profile,
+                episode_context_hits=hits,
+            ))
+            counter += 1
 
     rolling_gap = max(1, len(segments) // 24) if duration > 1800 else 6
     rolling_span = 14 if duration > 1800 else 10

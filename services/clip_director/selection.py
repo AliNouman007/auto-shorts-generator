@@ -7,6 +7,7 @@ from services import shorts_director
 from .audio import analyze_audio_peaks
 from .boundaries import optimize_candidate_boundaries
 from .candidates import generate_candidates
+from .episode_intelligence import build_fallback_episode_profile, transcript_samples
 from .episode_map import build_episode_map
 from .judge import apply_llm_judgement
 from .scoring import score_candidate
@@ -15,8 +16,10 @@ from .types import AudioPeak, ClipConstraints, ClipMode, DirectorSelection, Epis
 
 
 LlmSelector = Callable[[EpisodeMap, ClipConstraints, str], list[DirectorSelection]]
+EpisodeProfileBuilder = Callable[[dict, str], dict]
 V2_MIN_FINAL_SCORE = 0.45
 V2_RESCUE_FINAL_SCORE = 0.12
+V2_MAX_QUALIFIED_CLIPS = 30
 
 
 def normalize_mode(mode: str | None) -> ClipMode:
@@ -29,7 +32,7 @@ def constraints_for_mode(mode: str | None) -> ClipConstraints:
         "mode": normalized,
         "min_duration": 60.0 if normalized == "highlights" else 30.0,
         "max_duration": 300.0 if normalized == "highlights" else 180.0,
-        "safety_max_clips": 12,
+        "safety_max_clips": V2_MAX_QUALIFIED_CLIPS,
     }
 
 
@@ -38,14 +41,7 @@ def viral_timestamp_engine_v2_enabled() -> bool:
 
 
 def target_v2_clip_count(duration: float) -> int:
-    minutes = float(duration or 0) / 60.0
-    if minutes > 45:
-        return 10
-    if minutes > 20:
-        return 6
-    if minutes >= 10:
-        return 3
-    return 1
+    return V2_MAX_QUALIFIED_CLIPS
 
 
 def _is_comedy_context(video_title: str, genre_hint: str) -> bool:
@@ -118,6 +114,8 @@ def _score_details_json(clip: dict) -> str:
         "base_score": clip.get("base_score", 0),
         "penalty": clip.get("penalty", 0),
         "boundary_notes": clip.get("boundary_notes", []),
+        "episode_context_hits": clip.get("episode_context_hits", []),
+        "episode_profile": clip.get("episode_profile", {}),
     }, ensure_ascii=False, sort_keys=True)
 
 
@@ -191,6 +189,7 @@ def _episode_map_for_shortlist(
     normalized_mode: ClipMode,
     genre_hint: str,
     shortlist: list[dict],
+    episode_profile: dict | None = None,
 ) -> EpisodeMap:
     episode_map = build_episode_map(
         segments=timeline["segments"],
@@ -199,6 +198,7 @@ def _episode_map_for_shortlist(
         title=video_title,
         mode=normalized_mode,
         genre_hint=genre_hint,
+        episode_profile=episode_profile,
     )
     episode_map["candidate_moments"] = shortlist[:30]
     episode_map["shortlisted_candidates"] = shortlist[:40]
@@ -220,6 +220,41 @@ def _rescue_v2_candidates(candidates: list[dict], comedy_context: bool) -> list[
         if float(candidate.get("final_score", 0) or 0) >= V2_RESCUE_FINAL_SCORE
     ]
     return rescue or list(candidates)
+
+
+def _top_up_v2_comedy_rescue(
+    eligible: list[dict],
+    candidates: list[dict],
+    target_count: int,
+    comedy_context: bool,
+) -> list[dict]:
+    if not comedy_context or len(eligible) >= target_count:
+        return eligible
+    filled = list(eligible)
+    existing_ids = {str(candidate.get("candidate_id")) for candidate in filled}
+    rescue_pool = _rescue_v2_candidates(candidates, comedy_context)
+    if len(rescue_pool) < target_count:
+        rescue_ids = {str(candidate.get("candidate_id")) for candidate in rescue_pool}
+        rescue_pool = rescue_pool + [
+            candidate for candidate in candidates
+            if str(candidate.get("candidate_id")) not in rescue_ids
+        ]
+    for candidate in rescue_pool:
+        if len(filled) >= target_count:
+            break
+        candidate_id = str(candidate.get("candidate_id"))
+        if candidate_id in existing_ids:
+            continue
+        filled.append({
+            **candidate,
+            "judge_status": candidate.get("judge_status") or "deterministic_rescue",
+            "selection_reason": (
+                candidate.get("selection_reason")
+                or "Selected by V2 comedy rescue because the transcript score was too sparse for this long comedy source."
+            ),
+        })
+        existing_ids.add(candidate_id)
+    return filled
 
 
 def _fill_v2_minimum(clips: list[dict], candidates: list[dict], target_count: int) -> list[dict]:
@@ -283,22 +318,45 @@ def select_dynamic_clips_v2(
     audio_path: str | None = None,
     audio_peaks: list[AudioPeak] | None = None,
     video_title: str = "",
+    video_description: str = "",
     mode: str = "shorts",
     genre_hint: str = "",
     ai_model: str = "openai",
     llm_selector: LlmSelector | None = None,
+    episode_profile_builder: EpisodeProfileBuilder | None = None,
 ) -> list[dict]:
     normalized_mode = normalize_mode(mode)
     constraints = constraints_for_mode(normalized_mode)
     peaks = audio_peaks if audio_peaks is not None else analyze_audio_peaks(audio_path)
     timeline = build_timeline(segments, duration, peaks)
     comedy_context = _is_comedy_context(video_title, genre_hint)
+    fallback_profile = build_fallback_episode_profile(
+        video_title,
+        timeline["segments"],
+        description=video_description,
+        genre_hint=genre_hint,
+    )
+    profile_seed = {
+        "title": video_title,
+        "description": video_description,
+        "genre_hint": genre_hint,
+        "detected_genre": fallback_profile.get("show_type", "auto"),
+        "transcript_samples": transcript_samples(timeline["segments"], duration),
+        "fallback_profile": fallback_profile,
+    }
+    try:
+        episode_profile = episode_profile_builder(profile_seed, ai_model) if episode_profile_builder else fallback_profile
+    except Exception:
+        episode_profile = fallback_profile
+    if not episode_profile:
+        episode_profile = fallback_profile
     engine_trace = [
         "V2 timestamp engine enabled",
         f"source_duration={float(duration):.1f}s mode={normalized_mode} comedy_context={comedy_context}",
         f"timeline_segments={len(timeline.get('segments', []))} audio_peaks={len(peaks)}",
+        f"episode_profile_source={episode_profile.get('source', 'unknown')} entities={len(episode_profile.get('important_entities', []))}",
     ]
-    rough_candidates = generate_candidates(timeline, constraints)
+    rough_candidates = generate_candidates(timeline, constraints, episode_profile=episode_profile)
     engine_trace.append(f"rough_candidates={len(rough_candidates)}")
     optimized = [
         candidate for candidate in (
@@ -314,25 +372,20 @@ def select_dynamic_clips_v2(
     engine_trace.append(f"deduped_candidates={len(deduped)}")
     if not deduped:
         return []
-    target_count = min(constraints["safety_max_clips"], target_v2_clip_count(duration))
-    minimum_count = min(constraints["safety_max_clips"], minimum_v2_clip_count(duration))
-    eligible = _eligible_v2_candidates(deduped)
-    if len(eligible) < minimum_count:
-        rescue = _rescue_v2_candidates(deduped, comedy_context)
-        rescue_ids = {str(candidate.get("candidate_id")) for candidate in eligible}
-        for candidate in rescue:
-            if str(candidate.get("candidate_id")) not in rescue_ids:
-                eligible.append({
-                    **candidate,
-                    "judge_status": "deterministic_rescue",
-                    "selection_reason": "Selected by V2 comedy rescue because the transcript/LLM signals were too sparse.",
-                })
-                rescue_ids.add(str(candidate.get("candidate_id")))
+    target_count = constraints["safety_max_clips"]
+    high_score_eligible = _eligible_v2_candidates(deduped)
+    eligible = _top_up_v2_comedy_rescue(
+        high_score_eligible,
+        deduped,
+        target_count,
+        comedy_context,
+    )
     eligible = _diversify_v2_candidates(eligible, duration, limit=60)
-    engine_trace.append(f"eligible_score_floor_{V2_MIN_FINAL_SCORE}={len(eligible)}")
-    engine_trace.append(f"minimum_required={minimum_count} target={target_count}")
+    engine_trace.append(f"eligible_score_floor_{V2_MIN_FINAL_SCORE}={len(high_score_eligible)}")
+    engine_trace.append(f"eligible_after_comedy_rescue={len(eligible)}")
+    engine_trace.append(f"qualified_cap={target_count}")
     judged: list[dict] = []
-    batch_size = max(6, target_count)
+    batch_size = max(6, min(10, target_count))
     if llm_selector:
         for offset in range(0, min(len(eligible), 60), batch_size):
             batch = eligible[offset:offset + batch_size]
@@ -347,6 +400,7 @@ def select_dynamic_clips_v2(
                 normalized_mode,
                 genre_hint,
                 batch,
+                episode_profile,
             )
             selections = llm_selector(episode_map, constraints, ai_model)
             accepted_batch = apply_llm_judgement(batch, selections)
@@ -368,8 +422,8 @@ def select_dynamic_clips_v2(
     judged = _fill_v2_minimum(judged, eligible, target_count)
     engine_trace.append(f"accepted_after_score_floor={before_fill_count}")
     engine_trace.append(f"selected_after_deterministic_fill={len(judged)}")
-    if len(judged) < minimum_count:
-        engine_trace.append("failed_minimum_required")
+    if not judged:
+        engine_trace.append("failed_no_qualified_candidates")
         return []
     episode_map = _episode_map_for_shortlist(
         timeline,
@@ -379,6 +433,7 @@ def select_dynamic_clips_v2(
         normalized_mode,
         genre_hint,
         judged,
+        episode_profile,
     )
     clips = [
         clip for clip in (
@@ -433,10 +488,12 @@ def select_dynamic_clips(
     audio_path: str | None = None,
     audio_peaks: list[AudioPeak] | None = None,
     video_title: str = "",
+    video_description: str = "",
     mode: str = "shorts",
     genre_hint: str = "",
     ai_model: str = "openai",
     llm_selector: LlmSelector | None = None,
+    episode_profile_builder: EpisodeProfileBuilder | None = None,
     allow_fallback: bool = True,
     use_v2: bool | None = None,
 ) -> list[dict]:
@@ -450,10 +507,12 @@ def select_dynamic_clips(
             audio_path=audio_path,
             audio_peaks=audio_peaks,
             video_title=video_title,
+            video_description=video_description,
             mode=mode,
             genre_hint=genre_hint,
             ai_model=ai_model,
             llm_selector=llm_selector,
+            episode_profile_builder=episode_profile_builder,
         )
     normalized_mode = normalize_mode(mode)
     constraints = constraints_for_mode(normalized_mode)

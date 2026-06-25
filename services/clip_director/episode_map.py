@@ -23,6 +23,7 @@ def build_episode_map(
     title: str = "",
     mode: ClipMode = "shorts",
     genre_hint: str = "",
+    episode_profile: dict | None = None,
 ) -> EpisodeMap:
     clean_segments = [
         {
@@ -43,4 +44,5 @@ def build_episode_map(
         "segments": clean_segments,
         "audio_peaks": clean_peaks,
         "candidate_moments": peaks_to_moments(clean_peaks, clean_segments, duration, mode),
+        "episode_profile": episode_profile or {},
     }

@@ -27,7 +27,7 @@ from fastapi.templating import Jinja2Templates
 
 from services import exporting, presets, shorts_director, youtube_upload
 from services.clip_director import selection as clip_selection
-from services.clip_director.llm import request_llm_selection
+from services.clip_director.llm import request_llm_episode_profile, request_llm_selection
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -96,6 +96,10 @@ YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
 REQUIRED_VIDEO_TOOLS = ("ffmpeg", "ffprobe")
 CAPTION_MAX_LINE_LENGTH = 32
 CAPTION_MAX_LINES = 3
+CAPTION_MAX_SECONDS = 2.5
+CAPTION_MAX_WORDS = 6
+CAPTION_WORD_GAP_SECONDS = 0.9
+CAPTION_LANGUAGE_HINT = env_value("CAPTION_LANGUAGE_HINT", "hi").lower()
 
 
 def command_available(command: str) -> bool:
@@ -255,6 +259,7 @@ def init_db():
     for col_sql in [
         "ALTER TABLE videos ADD COLUMN steps_json TEXT",
         "ALTER TABLE videos ADD COLUMN thumbnail TEXT",
+        "ALTER TABLE videos ADD COLUMN description TEXT",
         "ALTER TABLE shorts ADD COLUMN title TEXT",
         "ALTER TABLE shorts ADD COLUMN virality_score INTEGER",
         "ALTER TABLE shorts ADD COLUMN completion_score INTEGER",
@@ -703,8 +708,13 @@ def regenerate_short(short_id: int, preset_config: Optional[dict] = None) -> dic
     caption_text = (short.get("caption_text") or "").strip()
     if config.get("captions_enabled", True) and caption_text:
         srt_path = OUTPUTS_DIR / f"{Path(filename).stem}.srt"
-        srt_path.write_text(generate_srt(
-            [{"start": start, "end": end, "text": caption_text}], start, end),
+        srt_path.write_text(
+            generate_srt(
+                [{"start": start, "end": end, "text": caption_text}],
+                start,
+                end,
+                caption_mode="original",
+            ),
             encoding="utf-8",
         )
     elif filename:
@@ -1056,7 +1066,7 @@ async def fetch_channel_info(channel_id: str) -> dict:
 async def fetch_latest_uploads(channel_id: str, max_results: int = 10) -> list[dict]:
     """
     Fetch the latest uploads from the given channel using the YouTube Data API.
-    Returns list of dicts: {youtube_video_id, title, published_at, thumbnail}.
+    Returns list of dicts: {youtube_video_id, title, description, published_at, thumbnail}.
     """
     if not YOUTUBE_API_KEY or not channel_id:
         return []
@@ -1095,6 +1105,7 @@ async def fetch_latest_uploads(channel_id: str, max_results: int = 10) -> list[d
             videos.append({
                 "youtube_video_id": video_id,
                 "title": snippet.get("title", "Untitled"),
+                "description": snippet.get("description", ""),
                 "published_at": snippet.get("publishedAt", ""),
                 "thumbnail": thumb,
             })
@@ -1187,18 +1198,135 @@ def extract_audio(video_path: str, audio_path: str, video_id: Optional[int] = No
 # ---------------------------------------------------------------------------
 
 
-def build_whisper_transcription_data(model: str) -> dict:
-    return {
+def build_whisper_transcription_data(model: str, caption_mode: str = "hinglish") -> dict:
+    data = {
         "model": model,
         "response_format": "verbose_json",
+        "timestamp_granularities[]": ["word", "segment"],
     }
+    if str(caption_mode or "").lower() != "original" and CAPTION_LANGUAGE_HINT:
+        data["language"] = CAPTION_LANGUAGE_HINT
+    return data
 
 
-def build_gemini_transcription_prompt() -> str:
+INSTRUCTION_LEAK_PHRASES = (
+    "do not translate",
+    "roman hinglish",
+    "format your response",
+    "output only the json",
+    "transcribe this audio",
+    "timestamp granularities",
+    "preserve the speaker",
+)
+
+
+def is_transcription_instruction_leak(text: str) -> bool:
+    lowered = str(text or "").strip().lower()
+    return bool(lowered and any(phrase in lowered for phrase in INSTRUCTION_LEAK_PHRASES))
+
+
+def _clean_transcription_words(words: list[dict] | None, offset_seconds: float = 0.0) -> list[dict]:
+    cleaned = []
+    for word in words or []:
+        try:
+            start = float(word.get("start", 0)) + offset_seconds
+            end = float(word.get("end", start)) + offset_seconds
+        except (TypeError, ValueError):
+            continue
+        text = str(word.get("word") or word.get("text") or "").strip()
+        if not text:
+            continue
+        cleaned.append({"start": start, "end": max(start, end), "word": text})
+    return cleaned
+
+
+def _words_overlapping_segment(words: list[dict], start: float, end: float) -> list[dict]:
+    return [
+        word for word in words
+        if float(word.get("end", word.get("start", 0))) > start - 0.05
+        and float(word.get("start", 0)) < end + 0.05
+    ]
+
+
+def _segments_from_words(words: list[dict]) -> list[dict]:
+    segments = []
+    current: list[dict] = []
+    for word in words:
+        if current:
+            gap = float(word["start"]) - float(current[-1]["end"])
+            duration = float(current[-1]["end"]) - float(current[0]["start"])
+            if gap > 1.0 or duration >= 12.0 or len(current) >= 18:
+                text = " ".join(item["word"] for item in current).strip()
+                if text and not is_transcription_instruction_leak(text):
+                    segments.append({
+                        "start": float(current[0]["start"]),
+                        "end": float(current[-1]["end"]),
+                        "text": text,
+                        "words": current,
+                    })
+                current = []
+        current.append(word)
+    if current:
+        text = " ".join(item["word"] for item in current).strip()
+        if text and not is_transcription_instruction_leak(text):
+            segments.append({
+                "start": float(current[0]["start"]),
+                "end": float(current[-1]["end"]),
+                "text": text,
+                "words": current,
+            })
+    return segments
+
+
+def segments_from_transcription_response(payload: dict) -> list[dict]:
+    if not isinstance(payload, dict):
+        return []
+    raw_segments = payload.get("segments") if isinstance(payload.get("segments"), list) else []
+    top_level_words = _clean_transcription_words(
+        payload.get("words") if isinstance(payload.get("words"), list) else []
+    )
+    if not raw_segments:
+        return _segments_from_words(top_level_words)
+
+    segments = []
+    for segment in raw_segments:
+        if not isinstance(segment, dict):
+            continue
+        try:
+            start = max(0.0, float(segment.get("start", 0)))
+            end = max(start, float(segment.get("end", start)))
+        except (TypeError, ValueError):
+            continue
+        text = str(segment.get("text", "")).strip()
+        if not text or is_transcription_instruction_leak(text):
+            continue
+        segment_words = _clean_transcription_words(
+            segment.get("words") if isinstance(segment.get("words"), list) else []
+        )
+        if not segment_words and top_level_words:
+            segment_words = _words_overlapping_segment(top_level_words, start, end)
+        clean_segment = {**segment, "start": start, "end": end, "text": text}
+        if segment_words:
+            clean_segment["words"] = segment_words
+        segments.append(clean_segment)
+    return segments
+
+
+def build_gemini_transcription_prompt(caption_mode: str = "hinglish") -> str:
+    if str(caption_mode or "").lower() == "original":
+        script_instruction = (
+            "Keep the original language and script chosen by the transcription model. "
+            "Do not romanize the text. "
+        )
+    else:
+        script_instruction = (
+            "For Hindi, Urdu, Punjabi, or mixed Hindi-English speech, write the original spoken words in Roman Hinglish. "
+            "Keep English words as English. "
+        )
     return (
         "Transcribe this audio accurately and preserve the speaker's original words. "
-        "Do not translate, romanize, rewrite, or summarize the speech. "
-        "Keep the original language and script chosen by the transcription model. "
+        "Do not translate to English, rewrite, or summarize the speech. "
+        f"{script_instruction}"
         "Format your response as a JSON array of objects, each with: "
         '"start" (seconds, float), "end" (seconds, float), "text" (string). '
         "Keep each segment under 15 seconds. Output ONLY the JSON array, no explanation."
@@ -1308,6 +1436,12 @@ def offset_transcription_segments(segments: list[dict], offset_seconds: float) -
             "start": start,
             "end": end,
             "text": str(segment.get("text", "")).strip(),
+            **({
+                "words": _clean_transcription_words(
+                    segment.get("words") if isinstance(segment.get("words"), list) else [],
+                    offset_seconds=float(offset_seconds),
+                )
+            } if isinstance(segment.get("words"), list) else {}),
         })
     return shifted
 
@@ -1323,17 +1457,20 @@ def transcribe_with_whisper_local(audio_path: str, video_id: Optional[int] = Non
     """Try the local openai-whisper CLI. Returns segments list or None."""
     try:
         out_dir = Path(audio_path).parent
+        command = [
+            "whisper",
+            audio_path,
+            "--task",
+            "transcribe",
+            "--output_format",
+            "json",
+            "--output_dir",
+            str(out_dir),
+        ]
+        if CAPTION_LANGUAGE_HINT:
+            command.extend(["--language", CAPTION_LANGUAGE_HINT])
         result = run_command(
-            [
-                "whisper",
-                audio_path,
-                "--task",
-                "transcribe",
-                "--output_format",
-                "json",
-                "--output_dir",
-                str(out_dir),
-            ],
+            command,
             timeout=300,
             video_id=video_id,
         )
@@ -1342,7 +1479,7 @@ def transcribe_with_whisper_local(audio_path: str, video_id: Optional[int] = Non
         json_path = out_dir / (Path(audio_path).stem + ".json")
         if json_path.exists():
             data = json.loads(json_path.read_text())
-            return data.get("segments", [])
+            return segments_from_transcription_response(data)
     except CancelledProcessing:
         raise
     except Exception:
@@ -1364,7 +1501,7 @@ async def transcribe_with_openai_api(audio_path: str) -> Optional[list[dict]]:
                     data=build_whisper_transcription_data("whisper-1"),
                 )
         if response.status_code == 200:
-            return response.json().get("segments", [])
+            return segments_from_transcription_response(response.json())
     except Exception:
         pass
     return None
@@ -1394,7 +1531,7 @@ async def transcribe_groq_audio_file(audio_path: str) -> list[dict]:
         if response.status_code == 413:
             raise GroqRequestTooLarge(error_message)
         raise RuntimeError(error_message)
-    return response.json().get("segments", [])
+    return segments_from_transcription_response(response.json())
 
 
 async def transcribe_groq_audio_chunks(
@@ -1734,6 +1871,19 @@ def request_dynamic_clip_selection(episode_map: dict, constraints: dict, ai_mode
     )
 
 
+def request_dynamic_episode_profile(seed: dict, ai_model: str) -> dict:
+    return request_llm_episode_profile(
+        seed,
+        ai_model,
+        openai_api_key=OPENAI_API_KEY,
+        openai_model=OPENAI_LLM_MODEL,
+        groq_api_key=GROQ_API_KEY,
+        groq_model=GROQ_LLM_MODEL,
+        gemini_api_key=GEMINI_API_KEY,
+        gemini_model=GEMINI_MODEL,
+    )
+
+
 def build_clips_from_segments(
     segments: list[dict],
     target_count: int = 5,
@@ -1778,6 +1928,7 @@ def select_clips_for_video(
     *,
     audio_path: str | None = None,
     video_title: str = "",
+    video_description: str = "",
     preset: Optional[dict] = None,
 ) -> list[dict]:
     if duration <= 90:
@@ -1788,10 +1939,12 @@ def select_clips_for_video(
         duration,
         audio_path=audio_path,
         video_title=video_title,
+        video_description=video_description,
         mode=config.get("clip_output_mode", "shorts"),
         genre_hint=config.get("genre_hint", ""),
         ai_model=ai_model,
         llm_selector=request_dynamic_clip_selection,
+        episode_profile_builder=request_dynamic_episode_profile,
         allow_fallback=False,
     )
     if clip_selection.viral_timestamp_engine_v2_enabled():
@@ -1817,6 +1970,17 @@ def seconds_to_srt_time(s: float) -> str:
     m, sec = divmod(rem, 60)
     ms = int((s - int(s)) * 1000)
     return f"{h:02d}:{m:02d}:{sec:02d},{ms:03d}"
+
+
+def srt_time_to_seconds(value: str) -> float:
+    hours, minutes, rest = str(value).split(":")
+    seconds, millis = rest.split(",")
+    return (
+        int(hours) * 3600
+        + int(minutes) * 60
+        + int(seconds)
+        + int(millis) / 1000.0
+    )
 
 
 DEVANAGARI_ROMAN_WORDS = {
@@ -1889,6 +2053,13 @@ def romanize_caption_text(text: str) -> str:
     return re.sub(r"\s+", " ", "".join(output)).strip()
 
 
+def normalize_caption_text(text: str, caption_mode: str = "hinglish") -> str:
+    cleaned = " ".join(str(text or "").split())
+    if str(caption_mode or "").lower() == "original":
+        return cleaned
+    return romanize_caption_text(cleaned)
+
+
 def wrap_caption_text(text: str) -> list[list[str]]:
     lines = textwrap.wrap(
         " ".join(str(text or "").split()),
@@ -1902,7 +2073,95 @@ def wrap_caption_text(text: str) -> list[list[str]]:
     ]
 
 
-def generate_srt(segments: list[dict], clip_start: float, clip_end: float) -> str:
+def split_caption_text_units(text: str, duration: float) -> list[str]:
+    words = str(text or "").split()
+    if not words:
+        return []
+    word_unit_count = (len(words) + CAPTION_MAX_WORDS - 1) // CAPTION_MAX_WORDS
+    if word_unit_count <= 1:
+        return [" ".join(words)]
+    unit_count = int(max(
+        1,
+        int((max(0.1, duration) + CAPTION_MAX_SECONDS - 0.001) // CAPTION_MAX_SECONDS),
+        word_unit_count,
+    ))
+    unit_count = min(unit_count, len(words))
+    units = []
+    for index in range(unit_count):
+        start = round(index * len(words) / unit_count)
+        end = round((index + 1) * len(words) / unit_count)
+        chunk = " ".join(words[start:end]).strip()
+        if chunk:
+            units.append(chunk)
+    return units
+
+
+def _caption_units_from_word_timestamps(
+    segment: dict,
+    clip_start: float,
+    clip_end: float,
+    caption_mode: str,
+) -> list[dict]:
+    words = []
+    for raw_word in segment.get("words") or []:
+        if not isinstance(raw_word, dict):
+            continue
+        try:
+            start = float(raw_word.get("start", 0))
+            end = float(raw_word.get("end", start))
+        except (TypeError, ValueError):
+            continue
+        if end <= clip_start or start >= clip_end:
+            continue
+        text = normalize_caption_text(
+            str(raw_word.get("word") or raw_word.get("text") or ""),
+            caption_mode=caption_mode,
+        )
+        if not text or is_transcription_instruction_leak(text):
+            continue
+        words.append({
+            "start": max(0.0, start - clip_start),
+            "end": max(0.0, min(clip_end, end) - clip_start),
+            "word": text,
+        })
+    if not words:
+        return []
+
+    units = []
+    current: list[dict] = []
+
+    def flush_current() -> None:
+        if not current:
+            return
+        text = " ".join(word["word"] for word in current).strip()
+        if not text or is_transcription_instruction_leak(text):
+            return
+        start = float(current[0]["start"])
+        end = max(float(current[-1]["end"]), start + 0.35)
+        units.append({"start": start, "end": end, "text": text})
+
+    for word in words:
+        if current:
+            gap = float(word["start"]) - float(current[-1]["end"])
+            duration = float(current[-1]["end"]) - float(current[0]["start"])
+            if (
+                gap > CAPTION_WORD_GAP_SECONDS
+                or len(current) >= CAPTION_MAX_WORDS
+                or duration >= CAPTION_MAX_SECONDS
+            ):
+                flush_current()
+                current = []
+        current.append(word)
+    flush_current()
+    return units
+
+
+def generate_srt(
+    segments: list[dict],
+    clip_start: float,
+    clip_end: float,
+    caption_mode: str = "hinglish",
+) -> str:
     lines = []
     idx = 1
     for seg in segments:
@@ -1915,20 +2174,43 @@ def generate_srt(segments: list[dict], clip_start: float, clip_end: float) -> st
         text = seg.get("text", "").strip()
         if not text:
             continue
-        caption_blocks = wrap_caption_text(text)
-        if not caption_blocks:
+        if is_transcription_instruction_leak(text):
+            continue
+        word_units = _caption_units_from_word_timestamps(
+            seg,
+            clip_start,
+            clip_end,
+            caption_mode,
+        )
+        if word_units:
+            for unit in word_units:
+                for caption_lines in wrap_caption_text(unit["text"]):
+                    lines += [
+                        str(idx),
+                        f"{seconds_to_srt_time(unit['start'])} --> {seconds_to_srt_time(unit['end'])}",
+                        *caption_lines,
+                        "",
+                    ]
+                    idx += 1
             continue
         span = max(0.1, re - rs)
-        for block_idx, caption_lines in enumerate(caption_blocks):
-            block_start = rs + (span * block_idx / len(caption_blocks))
-            block_end = rs + (span * (block_idx + 1) / len(caption_blocks))
-            lines += [
-                str(idx),
-                f"{seconds_to_srt_time(block_start)} --> {seconds_to_srt_time(block_end)}",
-                *caption_lines,
-                "",
-            ]
-            idx += 1
+        caption_units = split_caption_text_units(
+            normalize_caption_text(text, caption_mode=caption_mode),
+            span,
+        )
+        if not caption_units:
+            continue
+        for unit_idx, caption_unit in enumerate(caption_units):
+            unit_start = rs + (span * unit_idx / len(caption_units))
+            unit_end = rs + (span * (unit_idx + 1) / len(caption_units))
+            for caption_lines in wrap_caption_text(caption_unit):
+                lines += [
+                    str(idx),
+                    f"{seconds_to_srt_time(unit_start)} --> {seconds_to_srt_time(unit_end)}",
+                    *caption_lines,
+                    "",
+                ]
+                idx += 1
     return "\n".join(lines)
 
 # ---------------------------------------------------------------------------
@@ -1994,9 +2276,10 @@ def _process_video_sync(
         ensure_not_cancelled(video_id)
 
         rows = db_read(
-            "SELECT youtube_video_id, title FROM videos WHERE id=?", (video_id,))
+            "SELECT youtube_video_id, title, description FROM videos WHERE id=?", (video_id,))
         yt_id = rows[0]["youtube_video_id"] if rows else str(video_id)
         source_title = rows[0]["title"] if rows else ""
+        source_description = rows[0]["description"] if rows else ""
         safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", yt_id)
         ai_model = effective_ai_model()
         segments: list[dict] = []
@@ -2089,6 +2372,7 @@ def _process_video_sync(
             ai_model=ai_model,
             audio_path=audio_path if audio_ok else None,
             video_title=source_title or "",
+            video_description=source_description or "",
         )
         if not clips:
             step(3, "error", "AI clip selection failed. No fallback clips were generated; retry after fixing the AI response.")
@@ -2097,7 +2381,6 @@ def _process_video_sync(
                         for c in clips) // max(1, len(clips))
         step(
             3, "done", f"AI ranking — {len(clips)} clips selected, avg virality {avg_score}%")
-        clips = clips[:12]
         ensure_not_cancelled(video_id)
 
         # ── Step 4: Export ────────────────────────────────────────────────────
@@ -2419,16 +2702,16 @@ async def check_youtube():
     for upload in uploads:
         if not db_read("SELECT id FROM videos WHERE youtube_video_id=?", (upload["youtube_video_id"],)):
             db_write(
-                "INSERT INTO videos (youtube_video_id, title, published_at, thumbnail, status) VALUES (?,?,?,?,'detected')",
+                "INSERT INTO videos (youtube_video_id, title, description, published_at, thumbnail, status) VALUES (?,?,?,?,?,'detected')",
                 (upload["youtube_video_id"], upload["title"],
-                 upload["published_at"], upload.get("thumbnail", "")),
+                 upload.get("description", ""), upload["published_at"], upload.get("thumbnail", "")),
             )
             added += 1
         else:
             # Update thumbnail if missing
             db_write(
-                "UPDATE videos SET thumbnail=? WHERE youtube_video_id=? AND (thumbnail IS NULL OR thumbnail='')",
-                (upload.get("thumbnail", ""), upload["youtube_video_id"]),
+                "UPDATE videos SET description=COALESCE(NULLIF(description,''), ?), thumbnail=CASE WHEN thumbnail IS NULL OR thumbnail='' THEN ? ELSE thumbnail END WHERE youtube_video_id=?",
+                (upload.get("description", ""), upload.get("thumbnail", ""), upload["youtube_video_id"]),
             )
 
     return {"detected": len(uploads), "new": added, "uploads": uploads}
