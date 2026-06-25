@@ -1,10 +1,15 @@
 import unittest
 from unittest import mock
+import asyncio
+import json
 
 from starlette.requests import Request
 
 import main
 from services import shorts_director
+from services.captions import deepgram as deepgram_captions
+from services.captions import export as caption_export
+from services.captions import line_builder, normalization
 
 
 class ExportFilterTest(unittest.TestCase):
@@ -50,6 +55,24 @@ class ExportFilterTest(unittest.TestCase):
 
 
 class YoutubeDownloadCommandTest(unittest.TestCase):
+    def test_extract_youtube_video_id_accepts_common_url_shapes(self):
+        cases = {
+            "dQw4w9WgXcQ": "dQw4w9WgXcQ",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=30": "dQw4w9WgXcQ",
+            "https://youtu.be/dQw4w9WgXcQ?si=abc": "dQw4w9WgXcQ",
+            "https://www.youtube.com/shorts/dQw4w9WgXcQ": "dQw4w9WgXcQ",
+            "youtube.com/embed/dQw4w9WgXcQ": "dQw4w9WgXcQ",
+        }
+
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(expected, main.extract_youtube_video_id(raw))
+
+    def test_extract_youtube_video_id_rejects_invalid_values(self):
+        for raw in ("", "not a url", "https://example.com/watch?v=dQw4w9WgXcQ", "too-short"):
+            with self.subTest(raw=raw):
+                self.assertEqual("", main.extract_youtube_video_id(raw))
+
     def test_ytdlp_command_uses_available_node_runtime(self):
         with mock.patch.object(main.shutil, "which") as which:
             which.side_effect = lambda command: {
@@ -283,6 +306,105 @@ class CaptionTranscriptionTest(unittest.TestCase):
 
 
 class CaptionFormattingTest(unittest.TestCase):
+    def test_deepgram_response_normalizes_utterances_and_words(self):
+        payload = {
+            "metadata": {"duration": 4.0, "model_info": {"id": {"arch": "nova-3"}}},
+            "results": {
+                "utterances": [{
+                    "start": 0.1,
+                    "end": 2.0,
+                    "confidence": 0.91,
+                    "transcript": "Hello kya haal hai?",
+                    "speaker": 1,
+                    "words": [
+                        {"word": "hello", "punctuated_word": "Hello", "start": 0.1, "end": 0.4, "confidence": 0.99, "language": "en", "speaker": 1},
+                        {"word": "kya", "start": 0.5, "end": 0.7, "confidence": 0.88, "language": "hi", "speaker": 1},
+                    ],
+                }],
+                "channels": [{"alternatives": [{"confidence": 0.93, "languages": ["en", "hi"], "words": []}]}],
+            },
+        }
+
+        result = deepgram_captions.normalize_deepgram_response(payload, model="nova-3")
+
+        self.assertEqual("deepgram", result["provider"])
+        self.assertEqual("nova-3", result["model"])
+        self.assertEqual("en,hi", result["language"])
+        self.assertAlmostEqual(0.93, result["confidence"])
+        self.assertEqual(1, len(result["segments"]))
+        self.assertEqual("Hello kya haal hai?", result["segments"][0]["text"])
+        self.assertEqual("Hello", result["segments"][0]["words"][0]["word"])
+        self.assertEqual(1, result["segments"][0]["speaker"])
+
+    def test_deepgram_chunk_merge_offsets_segments_and_words(self):
+        first = {
+            "segments": [{"start": 1.0, "end": 2.0, "text": "hello", "words": [{"start": 1.0, "end": 1.3, "word": "hello"}]}],
+            "words": [{"start": 1.0, "end": 1.3, "word": "hello"}],
+            "confidence": 0.9,
+            "language": "en",
+            "provider": "deepgram",
+            "model": "nova-3",
+        }
+        second = {
+            "segments": [{"start": 0.5, "end": 1.5, "text": "kya haal", "words": [{"start": 0.5, "end": 0.8, "word": "kya"}]}],
+            "words": [{"start": 0.5, "end": 0.8, "word": "kya"}],
+            "confidence": 0.7,
+            "language": "hi",
+            "provider": "deepgram",
+            "model": "nova-3",
+        }
+
+        merged = deepgram_captions.merge_chunk_results([(first, 0.0), (second, 480.0)])
+
+        self.assertEqual(2, len(merged["segments"]))
+        self.assertAlmostEqual(480.5, merged["segments"][1]["start"])
+        self.assertAlmostEqual(480.8, merged["segments"][1]["words"][0]["end"])
+        self.assertAlmostEqual(0.8, merged["confidence"])
+        self.assertEqual("en,hi", merged["language"])
+
+    def test_hinglish_normalization_keeps_english_and_romanizes_indic_scripts(self):
+        text = "Hello \u0924\u0941\u092e \u0915\u0948\u0938\u0947 \u0939\u094b \u062a\u0645 \u06a9\u06cc\u0633\u06d2 \u06c1\u0648"
+
+        normalized = normalization.normalize_caption_text(text, caption_mode="hinglish")
+
+        self.assertIn("Hello", normalized)
+        self.assertIn("tum kaise ho", normalized)
+        self.assertNotIn("\u0924\u0941\u092e", normalized)
+        self.assertNotIn("\u062a\u0645", normalized)
+
+    def test_caption_cues_use_word_timestamps_and_do_not_overlap(self):
+        segments = [{
+            "start": 10.0,
+            "end": 15.0,
+            "text": "kaise ho audience hassi",
+            "words": [
+                {"start": 10.1, "end": 10.4, "word": "kaise", "confidence": 0.9, "speaker": 0},
+                {"start": 10.5, "end": 10.8, "word": "ho", "confidence": 0.9, "speaker": 0},
+                {"start": 13.0, "end": 13.4, "word": "audience", "confidence": 0.8, "speaker": 0},
+                {"start": 13.5, "end": 13.8, "word": "hassi", "confidence": 0.8, "speaker": 0},
+            ],
+        }]
+
+        cues = line_builder.build_caption_cues(segments, clip_start=10.0, clip_end=15.0)
+
+        self.assertEqual(2, len(cues))
+        self.assertAlmostEqual(0.1, cues[0]["start"], places=1)
+        self.assertLessEqual(cues[0]["end"], cues[1]["start"])
+        self.assertEqual("kaise ho", cues[0]["text"])
+        self.assertEqual("audience hassi", cues[1]["text"])
+
+    def test_srt_export_uses_structured_caption_cues(self):
+        cues = [
+            {"start": 0.2, "end": 1.1, "text": "kaise ho"},
+            {"start": 1.4, "end": 2.2, "text": "audience hassi"},
+        ]
+
+        srt = caption_export.generate_srt_from_cues(cues)
+
+        self.assertIn("00:00:00,200 --> 00:00:01,100", srt)
+        self.assertIn("kaise ho", srt)
+        self.assertIn("audience hassi", srt)
+
     def test_srt_wraps_long_caption_into_blocks_with_at_most_three_lines(self):
         segments = [{
             "start": 0,
@@ -515,6 +637,73 @@ class ProcessingCaptionToggleTest(unittest.TestCase):
 
         self.assertIn("😂", srt_path.read_text(encoding="utf-8"))
 
+    def test_processing_writes_deepgram_caption_metadata_and_word_synced_srt(self):
+        source_path = main.UPLOADS_DIR / "unit_deepgram_captions.mp4"
+        source_path.write_text("source")
+        main.db_write(
+            "INSERT INTO videos (youtube_video_id, title, source_path, status) VALUES (?,?,?,'waiting')",
+            ("unit_deepgram_captions", "Deepgram captions", str(source_path)),
+        )
+        video_id = main.db_read(
+            "SELECT id FROM videos WHERE youtube_video_id=?",
+            ("unit_deepgram_captions",),
+        )[0]["id"]
+        srt_path = main.OUTPUTS_DIR / "unit_deepgram_captions_short_01.srt"
+        self.addCleanup(lambda: main.db_write("DELETE FROM shorts WHERE video_id=?", (video_id,)))
+        self.addCleanup(lambda: main.db_write("DELETE FROM videos WHERE id=?", (video_id,)))
+        self.addCleanup(lambda: source_path.unlink(missing_ok=True))
+        self.addCleanup(lambda: srt_path.unlink(missing_ok=True))
+
+        segment = {
+            "start": 0,
+            "end": 6,
+            "text": "kaise ho audience hassi",
+            "words": [
+                {"start": 0.2, "end": 0.5, "word": "kaise", "confidence": 0.92},
+                {"start": 0.6, "end": 0.9, "word": "ho", "confidence": 0.9},
+                {"start": 3.0, "end": 3.5, "word": "audience", "confidence": 0.88},
+                {"start": 3.6, "end": 4.0, "word": "hassi", "confidence": 0.86},
+            ],
+        }
+        transcript = {
+            "provider": "deepgram",
+            "model": "nova-3",
+            "language": "en,hi",
+            "confidence": 0.89,
+            "segments": [segment],
+            "words": segment["words"],
+            "status": "word_synced",
+        }
+        clip = {
+            "start": 0,
+            "end": 6,
+            "text": segment["text"],
+            "title": "Deepgram clip",
+            "virality_score": 80,
+            "completion_score": 90,
+            "hook_type": "comedy",
+        }
+
+        with (
+            mock.patch.object(main, "missing_tools_message", return_value=""),
+            mock.patch.object(main, "is_valid_video", return_value=True),
+            mock.patch.object(main, "get_video_duration", return_value=60),
+            mock.patch.object(main, "extract_audio", return_value=True),
+            mock.patch.object(main, "transcribe_audio_for_captions", return_value=transcript),
+            mock.patch.object(main, "select_clips_for_video", return_value=[clip]),
+            mock.patch.object(main, "export_short_clip", return_value=True),
+        ):
+            main._process_video_sync(video_id, str(source_path), captions_enabled=True)
+
+        short = main.db_read("SELECT * FROM shorts WHERE video_id=?", (video_id,))[0]
+        self.assertEqual("deepgram", short["caption_provider"])
+        self.assertEqual("nova-3", short["caption_model"])
+        self.assertEqual("en,hi", short["caption_language"])
+        self.assertAlmostEqual(0.89, short["caption_confidence"])
+        self.assertEqual("word_synced", short["caption_status"])
+        self.assertIn("kaise ho", short["caption_srt"])
+        self.assertIn("audience hassi", srt_path.read_text(encoding="utf-8"))
+
     def test_processing_stores_director_upload_metadata(self):
         source_path = main.UPLOADS_DIR / "unit_director_metadata.mp4"
         source_path.write_text("source")
@@ -563,6 +752,25 @@ class ProcessingCaptionToggleTest(unittest.TestCase):
         self.assertEqual("Fix This Shorts Mistake", short["upload_title"])
         self.assertIn("#shorts", short["upload_description"])
         self.assertEqual("Clear hook and payoff.", short["selection_reason"])
+
+    def test_generated_description_does_not_paste_caption_transcript(self):
+        caption_text = (
+            "kaise ho audience hassi phir judge bolta hai wah kya punchline thi "
+            "aur sab log clap karte hain contestant phir next joke start karta hai"
+        )
+
+        clip = shorts_director.enrich_clip_metadata({
+            "start": 0,
+            "end": 28,
+            "text": caption_text,
+            "title": "Audience Could Not Stop Laughing",
+            "hook_type": "comedy",
+        })
+
+        self.assertNotEqual(caption_text, clip["description"])
+        self.assertNotIn("kaise ho audience hassi", clip["description"])
+        self.assertIn("Audience Could Not Stop Laughing", clip["description"])
+        self.assertIn("#shorts", clip["upload_description"])
 
 
 class ClipSelectionTest(unittest.TestCase):
@@ -1149,34 +1357,22 @@ class ClipSelectionTest(unittest.TestCase):
         self.assertEqual(1, len(episode["audio_peaks"]))
         self.assertEqual(1, len(episode["segments"]))
 
-    def test_llm_selection_accepts_variable_count_and_duration(self):
-        from services.clip_director.selection import select_dynamic_clips
+    def test_use_v2_false_still_uses_v2_selector(self):
+        from services.clip_director import selection
 
-        segments = [
-            {"start": 0, "end": 80, "text": "The setup starts here and builds tension."},
-            {"start": 80, "end": 170, "text": "A funny payoff happens with audience laughter."},
-            {"start": 220, "end": 310, "text": "Another complete funny stage moment happens."},
-        ]
+        expected = [{"timestamp_engine": "v2", "start": 0, "end": 90}]
+        with mock.patch.object(selection, "select_dynamic_clips_v2", return_value=expected) as selector:
+            clips = selection.select_dynamic_clips(
+                [{"start": 0, "end": 90, "text": "The setup gets a big laugh."}],
+                duration=120,
+                audio_peaks=[],
+                ai_model="gemini",
+                mode="shorts",
+                use_v2=False,
+            )
 
-        def fake_llm_selector(episode_map, constraints, ai_model):
-            return [
-                {"start": 0, "end": 170, "title": "Full Funny Setup", "reason": "Complete stage joke."},
-                {"start": 220, "end": 310, "title": "Second Big Laugh", "reason": "Another complete moment."},
-            ]
-
-        clips = select_dynamic_clips(
-            segments,
-            duration=400,
-            audio_peaks=[],
-            ai_model="gemini",
-            mode="shorts",
-            llm_selector=fake_llm_selector,
-            use_v2=False,
-        )
-
-        self.assertEqual(2, len(clips))
-        self.assertEqual(170, clips[0]["duration"])
-        self.assertEqual(90, clips[1]["duration"])
+        self.assertEqual(expected, clips)
+        selector.assert_called_once()
 
     def test_shorts_mode_rejects_llm_clips_over_three_minutes(self):
         from services.clip_director.selection import select_dynamic_clips
@@ -1196,25 +1392,13 @@ class ClipSelectionTest(unittest.TestCase):
         self.assertTrue(all(clip["duration"] <= 180 for clip in clips))
 
     def test_highlights_mode_allows_five_minute_clips(self):
-        from services.clip_director.selection import select_dynamic_clips
+        from services.clip_director.selection import constraints_for_mode
 
-        def fake_llm_selector(episode_map, constraints, ai_model):
-            return [{"start": 0, "end": 300, "title": "Full Stage Bit", "reason": "Needs full setup and payoff."}]
+        constraints = constraints_for_mode("highlights")
 
-        clips = select_dynamic_clips(
-            [{"start": 0, "end": 300, "text": "A full five minute comedy bit."}],
-            duration=360,
-            audio_peaks=[],
-            ai_model="gemini",
-            mode="highlights",
-            llm_selector=fake_llm_selector,
-            use_v2=False,
-        )
+        self.assertEqual(300, constraints["max_duration"])
 
-        self.assertEqual(1, len(clips))
-        self.assertEqual(300, clips[0]["duration"])
-
-    def test_dynamic_selection_falls_back_without_llm(self):
+    def test_dynamic_selection_without_llm_still_uses_v2_scoring(self):
         from services.clip_director.selection import select_dynamic_clips
 
         segments = [
@@ -1230,11 +1414,10 @@ class ClipSelectionTest(unittest.TestCase):
             ai_model="openai",
             mode="shorts",
             llm_selector=lambda *_args: [],
-            use_v2=False,
         )
 
         self.assertTrue(clips)
-        self.assertTrue(any(clip.get("has_audio_peak") for clip in clips))
+        self.assertTrue(all(clip.get("timestamp_engine") == "v2" for clip in clips))
 
     def test_main_passes_audio_title_mode_and_genre_to_dynamic_director(self):
         segments = [{"start": 0, "end": 120, "text": "A complete funny clip."}]
@@ -1250,7 +1433,7 @@ class ClipSelectionTest(unittest.TestCase):
             "selection_reason": "Selected dynamically.",
         }
 
-        with mock.patch.object(main.shorts_director, "select_dynamic_clips", return_value=[clip]) as selector:
+        with mock.patch.object(main.clip_selection, "select_dynamic_clips", return_value=[clip]) as selector:
             clips = main.select_clips_for_video(
                 segments,
                 duration=300,
@@ -1322,9 +1505,9 @@ class ClipSelectionTest(unittest.TestCase):
 
     def test_main_does_not_fall_back_to_legacy_selector_when_v2_returns_no_clips(self):
         with (
-            mock.patch.object(main.shorts_director, "select_dynamic_clips", return_value=[]) as dynamic_selector,
+            mock.patch.object(main.clip_selection, "select_dynamic_clips", return_value=[]) as dynamic_selector,
+            mock.patch.object(main.shorts_director, "select_dynamic_clips") as legacy_dynamic,
             mock.patch.object(main.shorts_director, "select_director_clips") as legacy_selector,
-            mock.patch("services.clip_director.selection.viral_timestamp_engine_v2_enabled", return_value=True),
         ):
             clips = main.select_clips_for_video(
                 [{"start": 0, "end": 120, "text": "Comedy transcript."}],
@@ -1334,6 +1517,7 @@ class ClipSelectionTest(unittest.TestCase):
 
         self.assertEqual([], clips)
         dynamic_selector.assert_called_once()
+        legacy_dynamic.assert_not_called()
         legacy_selector.assert_not_called()
 
     def test_complete_short_clip_keeps_source_as_one_clip(self):
@@ -1342,15 +1526,16 @@ class ClipSelectionTest(unittest.TestCase):
             {"start": 12.5, "end": 58, "text": "Here is the payoff for the full short."},
         ]
 
-        clips = shorts_director.complete_short_clip(segments, duration=58)
+        clips = main.complete_short_clip(segments, duration=58)
 
         self.assertEqual(1, len(clips))
         self.assertEqual(0, clips[0]["start"])
         self.assertEqual(58, clips[0]["end"])
         self.assertEqual("Complete short", clips[0]["title"])
         self.assertEqual("complete_short", clips[0]["hook_type"])
+        self.assertEqual("v2", clips[0]["timestamp_engine"])
         self.assertIn("Here is the hook.", clips[0]["text"])
-        self.assertIn("not being split", clips[0]["selection_reason"])
+        self.assertIn("already short", clips[0]["selection_reason"])
 
     def test_director_prompt_requires_hcvp_json_metadata(self):
         candidates = [{
@@ -1373,30 +1558,13 @@ class ClipSelectionTest(unittest.TestCase):
         self.assertIn("upload_description", prompt)
         self.assertIn("strict JSON", prompt)
 
-    def test_director_clips_include_review_and_upload_metadata(self):
-        segments = [
-            {"start": 0, "end": 8, "text": "Most creators lose viewers in the first two seconds."},
-            {"start": 8.5, "end": 23, "text": "The problem is they keep the slow setup before showing the result."},
-            {"start": 23.2, "end": 41, "text": "Cut straight to the mistake, then explain the context after the viewer is curious."},
-            {"start": 41.3, "end": 58, "text": "That one change makes the Short feel faster and keeps people watching."},
-        ]
-
-        clips = shorts_director.select_director_clips(segments, duration=58, ai_model="openai")
-
-        self.assertEqual(1, len(clips))
-        for field in (
-            "title",
-            "description",
-            "upload_title",
-            "upload_description",
-            "hook",
-            "context",
-            "value",
-            "payoff",
-            "selection_reason",
-        ):
-            self.assertTrue(clips[0].get(field), field)
-        self.assertLessEqual(len(clips[0]["upload_title"]), 60)
+    def test_legacy_director_clip_selector_is_removed(self):
+        with self.assertRaisesRegex(RuntimeError, "Legacy clip selection has been removed"):
+            shorts_director.select_director_clips(
+                [{"start": 0, "end": 58, "text": "A complete moment."}],
+                duration=58,
+                ai_model="openai",
+            )
 
     def test_director_validation_downgrades_filler_intro(self):
         segments = [
@@ -1490,12 +1658,9 @@ class ClipSelectionTest(unittest.TestCase):
         self.assertEqual(75, clips[0]["end"])
         self.assertEqual("complete_short", clips[0]["hook_type"])
 
-    def test_fallback_short_source_video_does_not_create_overlapping_clips(self):
-        clips = main.fallback_clips(75)
-
-        self.assertEqual(1, len(clips))
-        self.assertEqual(0, clips[0]["start"])
-        self.assertEqual(75, clips[0]["end"])
+    def test_legacy_fallback_clips_are_removed(self):
+        with self.assertRaisesRegex(RuntimeError, "Legacy clip fallback has been removed"):
+            main.fallback_clips(75)
 
 
 class VideoActionsTest(unittest.TestCase):
@@ -1603,6 +1768,18 @@ class VideoActionsTest(unittest.TestCase):
         self.assertEqual("", video["source_path"])
         self.assertEqual([], main.db_read("SELECT id FROM shorts WHERE video_id=?", (self.video_id,)))
 
+    def test_delete_video_record_removes_source_shorts_and_video_row(self):
+        self._create_short("unit_cancel_short.mp4")
+        main.db_write("UPDATE videos SET status='completed' WHERE id=?", (self.video_id,))
+
+        deleted = main.delete_video_record(self.video_id)
+
+        self.assertTrue(deleted)
+        self.assertFalse(self.source_path.exists())
+        self.assertEqual([], main.db_read("SELECT id FROM shorts WHERE video_id=?", (self.video_id,)))
+        self.assertEqual([], main.db_read("SELECT id FROM videos WHERE id=?", (self.video_id,)))
+        self.video_id = None
+
     def test_successful_processing_clears_previous_error_message(self):
         main.db_write(
             "UPDATE videos SET error_message=?, status='waiting' WHERE id=?",
@@ -1692,9 +1869,39 @@ class DashboardRenderingTest(unittest.TestCase):
         self.assertIn("Generate Shorts", html)
         self.assertIn("Upload File", html)
         self.assertIn("Delete Video", html)
+        self.assertIn('aria-label="Remove video from list"', html)
+        self.assertIn("deleteVideoRecord(1, this)", html)
         self.assertIn('id="captions-toggle-1"', html)
         self.assertIn("Captions", html)
-        self.assertNotIn("Download &amp; Generate", html)
+        self.assertNotIn('id="dl-btn-1"', html)
+
+    def test_dashboard_has_paste_url_download_control(self):
+        request = Request({
+            "type": "http",
+            "method": "GET",
+            "path": "/",
+            "headers": [],
+        })
+        response = main.templates.TemplateResponse(
+            request,
+            "index.html",
+            context={
+                "videos": [],
+                "channel_id": "test",
+                "ai_model": "groq",
+                "has_youtube_key": True,
+                "has_openai_key": False,
+                "has_gemini_key": False,
+                "has_groq_key": True,
+            },
+        )
+        html = response.body.decode()
+        js = (main.STATIC_DIR / "app.js").read_text()
+
+        self.assertIn('id="youtube-url-input"', html)
+        self.assertIn("Download &amp; Generate", html)
+        self.assertIn("downloadYoutubeUrl", html)
+        self.assertIn("/youtube-url", js)
 
     def test_dashboard_header_uses_clear_status_labels(self):
         request = Request({
@@ -1882,7 +2089,7 @@ class DashboardRenderingTest(unittest.TestCase):
         self.assertNotIn("Score 0%", html)
         self.assertIn("Processing Log", html)
 
-    def test_v2_short_renders_expandable_engine_log(self):
+    def test_v2_short_hides_engine_log_but_keeps_score_badges(self):
         request = Request({
             "type": "http",
             "method": "GET",
@@ -1927,8 +2134,11 @@ class DashboardRenderingTest(unittest.TestCase):
         )
         html = response.body.decode()
 
-        self.assertIn("V2 Engine Log", html)
-        self.assertIn("audioReaction", html)
+        self.assertIn("Engine v2", html)
+        self.assertIn("Source audio_peak", html)
+        self.assertIn("Score 82%", html)
+        self.assertNotIn("V2 Engine Log", html)
+        self.assertNotIn("audioReaction", html)
         self.assertIn("Processing Log", html)
 
     def test_live_short_card_renders_v2_timestamp_badges(self):
@@ -2093,6 +2303,152 @@ class DashboardRenderingTest(unittest.TestCase):
         self.assertIn("Score 91%", html)
         self.assertIn("Judge accepted", html)
 
+    def test_review_page_renders_simple_metadata_without_caption_editor_or_engine_log(self):
+        request = Request({
+            "type": "http",
+            "method": "GET",
+            "path": "/short/44/review",
+            "headers": [],
+        })
+        response = main.templates.TemplateResponse(
+            request,
+            "review.html",
+            context={
+                "short": {
+                    "id": 44,
+                    "video_id": 2,
+                    "filename": "ready_short.mp4",
+                    "source_path": "",
+                    "title": "Ready Short",
+                    "upload_title": "Ready Short",
+                    "description": "",
+                    "upload_description": "",
+                    "caption_text": "kaise ho",
+                    "caption_provider": "deepgram",
+                    "caption_model": "nova-3",
+                    "caption_language": "en,hi",
+                    "caption_confidence": 0.91,
+                    "caption_status": "word_synced",
+                    "caption_cues_json": json.dumps([
+                        {"start": 0.2, "end": 1.0, "text": "kaise ho", "confidence": 0.91}
+                    ]),
+                    "score_details_json": "{\"features\":{\"audioReaction\":0.9}}",
+                    "start_time": 0,
+                    "end_time": 21,
+                    "duration": 21,
+                    "status": "draft",
+                    "source_title": "Source video",
+                    "youtube_video_id": "source123",
+                    "latest_upload": None,
+                },
+                "youtube_connected": False,
+            },
+        )
+        html = response.body.decode()
+
+        self.assertIn("Captions deepgram", html)
+        self.assertIn("Language en,hi", html)
+        self.assertIn("Confidence 91%", html)
+        self.assertIn('id="review-title"', html)
+        self.assertIn('id="review-description"', html)
+        self.assertNotIn("Upload Title", html)
+        self.assertNotIn("Upload Description", html)
+        self.assertNotIn("caption-editor", html)
+        self.assertNotIn("data-caption-cue-row", html)
+        self.assertNotIn("saveCaptionRows", html)
+        self.assertNotIn("V2 Engine Log", html)
+
+
+class VideoSourceClassificationTest(unittest.TestCase):
+    def test_parse_youtube_duration(self):
+        self.assertEqual(main.parse_youtube_duration("PT45S"), 45.0)
+        self.assertEqual(main.parse_youtube_duration("PT1M30S"), 90.0)
+        self.assertEqual(main.parse_youtube_duration("PT1H2M3S"), 3723.0)
+        self.assertIsNone(main.parse_youtube_duration(""))
+
+    def test_classify_source_video_by_duration(self):
+        self.assertEqual(
+            main.classify_source_video({"id": 1, "source_duration": 45}),
+            "short",
+        )
+        self.assertEqual(
+            main.classify_source_video({"id": 2, "source_duration": 120}),
+            "short",
+        )
+        self.assertEqual(
+            main.classify_source_video({"id": 3, "source_duration": 181}),
+            "long",
+        )
+
+    def test_classify_source_video_by_shorts_hashtag_without_duration(self):
+        self.assertEqual(
+            main.classify_source_video({
+                "id": 4,
+                "title": "Funny moment #Shorts",
+                "description": "",
+            }),
+            "short",
+        )
+
+    def test_dashboard_renders_long_and_short_video_tabs(self):
+        request = Request({
+            "type": "http",
+            "method": "GET",
+            "path": "/",
+            "headers": [],
+        })
+        response = main.templates.TemplateResponse(
+            request,
+            "index.html",
+            context={
+                "videos": [
+                    {
+                        "id": 1,
+                        "youtube_video_id": "long_video",
+                        "title": "Long video",
+                        "published_at": "",
+                        "thumbnail": "",
+                        "status": "detected",
+                        "source_path": "",
+                        "error_message": "",
+                        "steps_json": "",
+                        "shorts": [],
+                        "source_kind": "long",
+                    },
+                    {
+                        "id": 2,
+                        "youtube_video_id": "short_video",
+                        "title": "Short video",
+                        "published_at": "",
+                        "thumbnail": "",
+                        "status": "detected",
+                        "source_path": "",
+                        "error_message": "",
+                        "steps_json": "",
+                        "shorts": [],
+                        "source_kind": "short",
+                    },
+                ],
+                "long_videos": [{"id": 1}],
+                "short_videos": [{"id": 2}],
+                "channel_id": "test",
+                "ai_model": "groq",
+                "has_youtube_key": True,
+                "has_openai_key": False,
+                "has_gemini_key": False,
+                "has_groq_key": True,
+            },
+        )
+        html = response.body.decode()
+
+        self.assertIn('id="video-tab-long"', html)
+        self.assertIn('id="video-tab-short"', html)
+        self.assertIn("Long Form (1)", html)
+        self.assertIn("Shorts (1)", html)
+        self.assertIn('data-source-kind="long"', html)
+        self.assertIn('data-source-kind="short"', html)
+        self.assertIn("switchVideoTab", (main.STATIC_DIR / "app.js").read_text())
+
 
 class StudioWorkflowTest(unittest.TestCase):
     def setUp(self):
@@ -2212,6 +2568,41 @@ class StudioWorkflowTest(unittest.TestCase):
         srt_path = export_short_clip.call_args.args[4]
         self.assertTrue(srt_path.endswith(".srt"))
         self.assertIn("Edited caption for export", (main.OUTPUTS_DIR / "studio_workflow_short_01.srt").read_text())
+
+    def test_update_short_captions_validates_and_saves_structured_rows(self):
+        cues = [
+            {"start": 0.2, "end": 1.0, "text": "kaise ho", "confidence": 0.92},
+            {"start": 1.2, "end": 2.0, "text": "audience hassi", "confidence": 0.88},
+        ]
+
+        short = main.update_short_captions(self.short_id, cues)
+
+        self.assertEqual("edited", short["caption_status"])
+        self.assertEqual("kaise ho audience hassi", short["caption_text"])
+        self.assertEqual(cues, json.loads(short["caption_cues_json"]))
+        self.assertIn("kaise ho", short["caption_srt"])
+
+    def test_update_short_captions_rejects_overlapping_rows(self):
+        cues = [
+            {"start": 0.2, "end": 1.0, "text": "kaise ho"},
+            {"start": 0.9, "end": 2.0, "text": "audience hassi"},
+        ]
+
+        with self.assertRaises(ValueError):
+            main.update_short_captions(self.short_id, cues)
+
+    def test_regenerate_short_prefers_edited_structured_caption_rows(self):
+        main.update_short_captions(self.short_id, [
+            {"start": 0.2, "end": 1.0, "text": "structured caption"},
+        ])
+
+        with mock.patch.object(main, "export_short_clip", return_value=True) as export_short_clip:
+            short = main.regenerate_short(self.short_id)
+
+        self.assertEqual("studio_workflow_short_01.mp4", short["filename"])
+        srt_path = export_short_clip.call_args.args[4]
+        self.assertIsNotNone(srt_path)
+        self.assertIn("structured caption", (main.OUTPUTS_DIR / "studio_workflow_short_01.srt").read_text())
 
     def test_regenerate_short_writes_unicode_srt_as_utf8(self):
         unicode_caption = "यह joke 😂 audience ko hasa deta hai."

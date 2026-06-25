@@ -18,6 +18,7 @@ import textwrap
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Request
@@ -26,6 +27,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from services import exporting, presets, shorts_director, youtube_upload
+from services.captions import deepgram as deepgram_captions
+from services.captions import export as caption_export
+from services.captions import line_builder as caption_line_builder
 from services.clip_director import selection as clip_selection
 from services.clip_director.llm import request_llm_episode_profile, request_llm_selection
 
@@ -88,6 +92,9 @@ GEMINI_MODEL = env_value("GEMINI_MODEL", "gemini-2.0-flash")
 GROQ_API_KEY = env_value("GROQ_API_KEY")
 GROQ_MODEL = env_value("GROQ_MODEL", "whisper-large-v3-turbo")
 GROQ_LLM_MODEL = env_value("GROQ_LLM_MODEL", "llama-3.1-8b-instant")
+DEEPGRAM_API_KEY = env_value("DEEPGRAM_API_KEY")
+DEEPGRAM_MODEL = env_value("DEEPGRAM_MODEL", "nova-3")
+DEEPGRAM_LANGUAGE = env_value("DEEPGRAM_LANGUAGE", "multi")
 WEBHOOK_SECRET = env_value("WEBHOOK_SECRET")
 PORT = env_int("PORT", 8000)
 
@@ -260,6 +267,7 @@ def init_db():
         "ALTER TABLE videos ADD COLUMN steps_json TEXT",
         "ALTER TABLE videos ADD COLUMN thumbnail TEXT",
         "ALTER TABLE videos ADD COLUMN description TEXT",
+        "ALTER TABLE videos ADD COLUMN source_duration REAL",
         "ALTER TABLE shorts ADD COLUMN title TEXT",
         "ALTER TABLE shorts ADD COLUMN virality_score INTEGER",
         "ALTER TABLE shorts ADD COLUMN completion_score INTEGER",
@@ -279,6 +287,14 @@ def init_db():
         "ALTER TABLE shorts ADD COLUMN final_score REAL",
         "ALTER TABLE shorts ADD COLUMN score_details_json TEXT",
         "ALTER TABLE shorts ADD COLUMN judge_status TEXT",
+        "ALTER TABLE shorts ADD COLUMN caption_provider TEXT",
+        "ALTER TABLE shorts ADD COLUMN caption_model TEXT",
+        "ALTER TABLE shorts ADD COLUMN caption_language TEXT",
+        "ALTER TABLE shorts ADD COLUMN caption_confidence REAL",
+        "ALTER TABLE shorts ADD COLUMN caption_words_json TEXT",
+        "ALTER TABLE shorts ADD COLUMN caption_cues_json TEXT",
+        "ALTER TABLE shorts ADD COLUMN caption_srt TEXT",
+        "ALTER TABLE shorts ADD COLUMN caption_status TEXT",
     ]:
         try:
             conn.execute(col_sql)
@@ -325,6 +341,40 @@ def db_read(sql: str, params: tuple = ()) -> list[dict]:
     finally:
         conn.close()
     return [dict(r) for r in rows]
+
+
+YOUTUBE_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+
+def extract_youtube_video_id(value: str) -> str:
+    """Return a YouTube video ID from a pasted URL or raw ID."""
+    text = (value or "").strip()
+    if not text:
+        return ""
+    if YOUTUBE_VIDEO_ID_RE.fullmatch(text):
+        return text
+
+    parse_target = text if "://" in text else f"https://{text}"
+    parsed = urlparse(parse_target)
+    host = parsed.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+
+    if host in {"youtube.com", "m.youtube.com", "music.youtube.com"}:
+        query_id = parse_qs(parsed.query).get("v", [""])[0]
+        if YOUTUBE_VIDEO_ID_RE.fullmatch(query_id):
+            return query_id
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) >= 2 and parts[0] in {"shorts", "embed", "live"}:
+            if YOUTUBE_VIDEO_ID_RE.fullmatch(parts[1]):
+                return parts[1]
+
+    if host == "youtu.be":
+        path_id = parsed.path.strip("/").split("/")[0]
+        if YOUTUBE_VIDEO_ID_RE.fullmatch(path_id):
+            return path_id
+
+    return ""
 
 
 def start_video_job(video_id: int) -> threading.Event:
@@ -459,6 +509,32 @@ def delete_source_video(video_id: int) -> bool:
     return True
 
 
+def delete_video_record(video_id: int) -> bool:
+    rows = db_read("SELECT * FROM videos WHERE id=?", (video_id,))
+    if not rows:
+        return False
+
+    video = rows[0]
+    if video["status"] in ("processing", "downloading"):
+        raise ValueError("Video is currently running. Cancel it before removing.")
+
+    request_video_cancel(video_id)
+    for short in db_read("SELECT id FROM shorts WHERE video_id=?", (video_id,)):
+        delete_short_record(short["id"])
+
+    source_path = video.get("source_path") or ""
+    if source_path:
+        Path(source_path).unlink(missing_ok=True)
+
+    safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", video["youtube_video_id"])
+    for partial in OUTPUTS_DIR.glob(f"{safe_id}_short_*"):
+        if partial.suffix in (".mp4", ".srt"):
+            partial.unlink(missing_ok=True)
+
+    db_write("DELETE FROM videos WHERE id=?", (video_id,))
+    return True
+
+
 def cleanup_cancelled_video(video_id: int, source_started_as_download: bool = False):
     rows = db_read("SELECT * FROM videos WHERE id=?", (video_id,))
     if not rows:
@@ -547,6 +623,14 @@ def parse_json_object(value: str, fallback: Optional[dict] = None) -> dict:
     return parsed if isinstance(parsed, dict) else (fallback or {})
 
 
+def parse_json_array(value: str, fallback: Optional[list] = None) -> list:
+    try:
+        parsed = json.loads(value or "[]")
+    except Exception:
+        return fallback or []
+    return parsed if isinstance(parsed, list) else (fallback or [])
+
+
 def get_default_preset() -> dict:
     rows = db_read(
         "SELECT * FROM presets WHERE is_default=1 ORDER BY id LIMIT 1")
@@ -612,6 +696,7 @@ def get_short_detail(short_id: int) -> dict:
     if not rows:
         raise ValueError("Short not found.")
     short = rows[0]
+    short["caption_cues"] = parse_json_array(short.get("caption_cues_json", ""))
     uploads = db_read(
         "SELECT * FROM short_uploads WHERE short_id=? ORDER BY created_at DESC, id DESC",
         (short_id,),
@@ -658,12 +743,66 @@ def update_short_metadata(short_id: int, data: dict) -> dict:
     if "title" in data and "upload_title" not in data:
         updates.append("upload_title=?")
         params.append(str(data.get("title") or ""))
+    if "description" in data and "upload_description" not in data:
+        updates.append("upload_description=?")
+        params.append(str(data.get("description") or ""))
     if not updates:
         return get_short_detail(short_id)
     updates.append("updated_at=datetime('now')")
     params.append(short_id)
     db_write(
         f"UPDATE shorts SET {', '.join(updates)} WHERE id=?", tuple(params))
+    return get_short_detail(short_id)
+
+
+def validate_caption_cues(cues: list[dict], duration: Optional[float] = None) -> list[dict]:
+    if not isinstance(cues, list):
+        raise ValueError("Caption cues must be a list.")
+    clean = []
+    previous_end = -0.001
+    max_duration = float(duration) if duration is not None else None
+    for cue in cues:
+        if not isinstance(cue, dict):
+            raise ValueError("Each caption cue must be an object.")
+        try:
+            start = float(cue.get("start"))
+            end = float(cue.get("end"))
+        except (TypeError, ValueError):
+            raise ValueError("Caption cue start and end must be numbers.")
+        text = " ".join(str(cue.get("text") or "").split())
+        if start < 0 or end <= start:
+            raise ValueError("Caption cue end must be after start.")
+        if start < previous_end - 0.001:
+            raise ValueError("Caption cues cannot overlap.")
+        if max_duration is not None and end > max_duration + 0.25:
+            raise ValueError("Caption cue is outside the Short duration.")
+        if not text:
+            raise ValueError("Caption cue text cannot be empty.")
+        clean_cue = {
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "text": text,
+        }
+        if cue.get("confidence") is not None:
+            try:
+                clean_cue["confidence"] = round(float(cue.get("confidence")), 4)
+            except (TypeError, ValueError):
+                pass
+        clean.append(clean_cue)
+        previous_end = end
+    return clean
+
+
+def update_short_captions(short_id: int, cues: list[dict]) -> dict:
+    short = get_short_detail(short_id)
+    duration = float(short.get("duration") or 0) or None
+    clean = validate_caption_cues(cues, duration=duration)
+    caption_text = " ".join(cue["text"] for cue in clean).strip()
+    srt = caption_export.generate_srt_from_cues(clean)
+    db_write(
+        "UPDATE shorts SET caption_text=?, caption_cues_json=?, caption_srt=?, caption_status='edited', updated_at=datetime('now') WHERE id=?",
+        (caption_text, json.dumps(clean), srt, short_id),
+    )
     return get_short_detail(short_id)
 
 
@@ -705,8 +844,15 @@ def regenerate_short(short_id: int, preset_config: Optional[dict] = None) -> dic
     filename = Path(short.get("filename") or f"short_{short_id}.mp4").name
     output_path = OUTPUTS_DIR / filename
     srt_path = None
+    caption_cues = parse_json_array(short.get("caption_cues_json", ""))
     caption_text = (short.get("caption_text") or "").strip()
-    if config.get("captions_enabled", True) and caption_text:
+    if config.get("captions_enabled", True) and caption_cues:
+        srt_path = OUTPUTS_DIR / f"{Path(filename).stem}.srt"
+        srt_path.write_text(
+            caption_export.generate_srt_from_cues(caption_cues),
+            encoding="utf-8",
+        )
+    elif config.get("captions_enabled", True) and caption_text:
         srt_path = OUTPUTS_DIR / f"{Path(filename).stem}.srt"
         srt_path.write_text(
             generate_srt(
@@ -1005,6 +1151,129 @@ def refresh_upload_analytics() -> int:
 # YouTube helpers
 # ---------------------------------------------------------------------------
 
+# YouTube Shorts can be up to 3 minutes.
+SHORT_SOURCE_MAX_DURATION = 180.0
+
+
+def parse_youtube_duration(value: str) -> Optional[float]:
+    """Parse YouTube ISO 8601 durations like PT1H2M30S into seconds."""
+    if not value or not value.startswith("PT"):
+        return None
+    hours = minutes = seconds = 0
+    for part in re.finditer(r"(\d+)([HMS])", value):
+        amount = int(part.group(1))
+        unit = part.group(2)
+        if unit == "H":
+            hours = amount
+        elif unit == "M":
+            minutes = amount
+        elif unit == "S":
+            seconds = amount
+    total = hours * 3600 + minutes * 60 + seconds
+    return float(total) if total > 0 else None
+
+
+def is_short_source(duration: Optional[float]) -> bool:
+    return bool(duration and float(duration) <= SHORT_SOURCE_MAX_DURATION)
+
+
+def looks_like_youtube_short_metadata(video: dict) -> bool:
+    blob = f"{video.get('title') or ''}\n{video.get('description') or ''}"
+    return bool(re.search(r"#\s*shorts?\b", blob, re.IGNORECASE))
+
+
+def effective_source_duration(video: dict) -> Optional[float]:
+    stored = video.get("source_duration")
+    if stored is not None and float(stored) > 0:
+        return float(stored)
+    source_path = video.get("source_path")
+    if source_path:
+        duration = get_video_duration(source_path)
+        if duration:
+            db_write(
+                "UPDATE videos SET source_duration=?, updated_at=datetime('now') WHERE id=?",
+                (duration, video["id"]),
+            )
+            return duration
+    return None
+
+
+def classify_source_video(video: dict) -> str:
+    duration = effective_source_duration(video)
+    if duration is not None:
+        return "short" if is_short_source(duration) else "long"
+    if looks_like_youtube_short_metadata(video):
+        return "short"
+    return "long"
+
+
+async def fetch_youtube_video_durations(
+    video_ids: list[str],
+    client: Optional[httpx.AsyncClient] = None,
+) -> dict[str, Optional[float]]:
+    """Batch-fetch video durations from the YouTube Data API."""
+    if not YOUTUBE_API_KEY:
+        return {}
+    ids = [vid.strip() for vid in video_ids if vid and vid.strip()]
+    if not ids:
+        return {}
+
+    durations: dict[str, Optional[float]] = {}
+
+    async def _fetch(active_client: httpx.AsyncClient) -> None:
+        for offset in range(0, len(ids), 50):
+            batch = ",".join(ids[offset:offset + 50])
+            details_resp = await active_client.get(
+                f"{YOUTUBE_API_BASE}/videos",
+                params={
+                    "part": "contentDetails",
+                    "id": batch,
+                    "key": YOUTUBE_API_KEY,
+                },
+            )
+            details_data = details_resp.json()
+            for detail in details_data.get("items", []):
+                iso_duration = detail.get("contentDetails", {}).get("duration", "")
+                durations[detail.get("id", "")] = parse_youtube_duration(iso_duration)
+
+    if client is not None:
+        await _fetch(client)
+    else:
+        async with httpx.AsyncClient(timeout=15) as active_client:
+            await _fetch(active_client)
+    return durations
+
+
+async def backfill_missing_video_durations(videos: Optional[list[dict]] = None) -> int:
+    """Fill missing source_duration values from YouTube for existing videos."""
+    if not YOUTUBE_API_KEY:
+        return 0
+    if videos is None:
+        rows = db_read(
+            "SELECT youtube_video_id, source_duration FROM videos "
+            "WHERE youtube_video_id IS NOT NULL AND (source_duration IS NULL OR source_duration <= 0)"
+        )
+    else:
+        rows = [
+            v for v in videos
+            if v.get("youtube_video_id")
+            and not (v.get("source_duration") and float(v["source_duration"]) > 0)
+        ]
+    video_ids = [row["youtube_video_id"] for row in rows]
+    if not video_ids:
+        return 0
+
+    durations = await fetch_youtube_video_durations(video_ids)
+    updated = 0
+    for yt_id, duration in durations.items():
+        if duration is not None and duration > 0:
+            db_write(
+                "UPDATE videos SET source_duration=?, updated_at=datetime('now') WHERE youtube_video_id=?",
+                (duration, yt_id),
+            )
+            updated += 1
+    return updated
+
 
 def _yt_channel_param(channel_id: str) -> dict:
     """
@@ -1091,25 +1360,33 @@ async def fetch_latest_uploads(channel_id: str, max_results: int = 10) -> list[d
         )
         pl_data = pl_resp.json()
 
-    videos = []
-    for item in pl_data.get("items", []):
-        snippet = item.get("snippet", {})
-        resource = snippet.get("resourceId", {})
-        video_id = resource.get("videoId")
-        if video_id:
-            thumbnails = snippet.get("thumbnails", {})
-            thumb = (
-                thumbnails.get("medium", {}).get("url")
-                or thumbnails.get("default", {}).get("url", "")
+        videos = []
+        for item in pl_data.get("items", []):
+            snippet = item.get("snippet", {})
+            resource = snippet.get("resourceId", {})
+            video_id = resource.get("videoId")
+            if video_id:
+                thumbnails = snippet.get("thumbnails", {})
+                thumb = (
+                    thumbnails.get("medium", {}).get("url")
+                    or thumbnails.get("default", {}).get("url", "")
+                )
+                videos.append({
+                    "youtube_video_id": video_id,
+                    "title": snippet.get("title", "Untitled"),
+                    "description": snippet.get("description", ""),
+                    "published_at": snippet.get("publishedAt", ""),
+                    "thumbnail": thumb,
+                })
+
+        if videos:
+            durations = await fetch_youtube_video_durations(
+                [item["youtube_video_id"] for item in videos],
+                client=client,
             )
-            videos.append({
-                "youtube_video_id": video_id,
-                "title": snippet.get("title", "Untitled"),
-                "description": snippet.get("description", ""),
-                "published_at": snippet.get("publishedAt", ""),
-                "thumbnail": thumb,
-            })
-    return videos
+            for item in videos:
+                item["source_duration"] = durations.get(item["youtube_video_id"])
+        return videos
 
 # ---------------------------------------------------------------------------
 # FFmpeg helpers
@@ -1577,6 +1854,134 @@ async def transcribe_with_groq_api(audio_path: str, video_id: Optional[int] = No
         raise RuntimeError(f"Groq transcription failed: {exc}") from exc
 
 
+async def transcribe_with_deepgram_api(audio_path: str, video_id: Optional[int] = None) -> Optional[dict]:
+    """Transcribe through Deepgram Nova with word timestamps and chunking."""
+    if not DEEPGRAM_API_KEY or not Path(audio_path).exists():
+        return None
+    try:
+        duration = get_audio_duration(audio_path)
+        if duration > 480:
+            chunks = split_audio_for_transcription(
+                audio_path,
+                chunk_seconds=480,
+                video_id=video_id,
+            )
+            results = []
+            try:
+                for chunk in chunks:
+                    chunk_path = str(chunk["path"])
+                    result = await deepgram_captions.transcribe_deepgram_file(
+                        chunk_path,
+                        api_key=DEEPGRAM_API_KEY,
+                        model=DEEPGRAM_MODEL,
+                        language=DEEPGRAM_LANGUAGE,
+                    )
+                    results.append((result, float(chunk.get("offset", 0))))
+            finally:
+                for chunk in chunks:
+                    chunk_path = str(chunk["path"])
+                    if chunk_path != audio_path:
+                        Path(chunk_path).unlink(missing_ok=True)
+            return deepgram_captions.merge_chunk_results(results)
+        return await deepgram_captions.transcribe_deepgram_file(
+            audio_path,
+            api_key=DEEPGRAM_API_KEY,
+            model=DEEPGRAM_MODEL,
+            language=DEEPGRAM_LANGUAGE,
+        )
+    except CancelledProcessing:
+        raise
+    except Exception:
+        return None
+
+
+def _segments_to_transcript_result(
+    segments: Optional[list[dict]],
+    provider: str,
+    model: str = "",
+    status: str = "segment_only",
+) -> Optional[dict]:
+    if not segments:
+        return None
+    words = []
+    for segment in segments:
+        words.extend(segment.get("words") or [])
+    return {
+        "provider": provider,
+        "model": model,
+        "language": CAPTION_LANGUAGE_HINT,
+        "confidence": 0.0,
+        "segments": segments,
+        "words": words,
+        "status": "word_synced" if words else status,
+    }
+
+
+def transcribe_audio_for_captions(
+    audio_path: str,
+    ai_model: str,
+    video_id: Optional[int] = None,
+) -> Optional[dict]:
+    if DEEPGRAM_API_KEY:
+        loop = asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(
+                transcribe_with_deepgram_api(audio_path, video_id=video_id))
+        finally:
+            loop.close()
+        if result and result.get("segments"):
+            return result
+
+    if ai_model == "groq" and GROQ_API_KEY:
+        loop = asyncio.new_event_loop()
+        try:
+            try:
+                segments = loop.run_until_complete(
+                    transcribe_with_groq_api(audio_path, video_id=video_id))
+            except RuntimeError:
+                segments = None
+        finally:
+            loop.close()
+        transcript = _segments_to_transcript_result(
+            segments, "groq", GROQ_MODEL)
+        if transcript:
+            return transcript
+
+    if ai_model == "gemini" and GEMINI_API_KEY:
+        loop = asyncio.new_event_loop()
+        try:
+            try:
+                segments = loop.run_until_complete(
+                    transcribe_with_gemini(audio_path))
+            except RuntimeError:
+                segments = None
+        finally:
+            loop.close()
+        transcript = _segments_to_transcript_result(
+            segments, "gemini", GEMINI_MODEL)
+        if transcript:
+            return transcript
+
+    if OPENAI_API_KEY:
+        loop = asyncio.new_event_loop()
+        try:
+            try:
+                segments = loop.run_until_complete(
+                    transcribe_with_openai_api(audio_path))
+            except Exception:
+                segments = None
+        finally:
+            loop.close()
+        transcript = _segments_to_transcript_result(
+            segments, "openai", "whisper-1")
+        if transcript:
+            return transcript
+
+    local_segments = transcribe_with_whisper_local(audio_path, video_id=video_id)
+    return _segments_to_transcript_result(
+        local_segments, "local-whisper", "whisper-cli")
+
+
 async def transcribe_with_gemini(audio_path: str) -> Optional[list[dict]]:
     """
     Transcribe audio using Google Gemini (gemini-2.0-flash).
@@ -1895,7 +2300,7 @@ def build_clips_from_segments(
         return []
     source_duration = max((float(seg.get("end", 0)) for seg in segments), default=0)
     mode = "highlights" if max_duration > 180 else "shorts"
-    clips = shorts_director.select_dynamic_clips(
+    clips = clip_selection.select_dynamic_clips(
         segments,
         source_duration,
         ai_model=ai_model,
@@ -1916,9 +2321,7 @@ def target_clip_count_for_duration(duration: float) -> int:
 
 
 def complete_short_clip(segments: list[dict], duration: float) -> list[dict]:
-    if clip_selection.viral_timestamp_engine_v2_enabled():
-        return clip_selection.complete_short_clip_v2(segments, duration)
-    return shorts_director.complete_short_clip(segments, duration)
+    return clip_selection.complete_short_clip_v2(segments, duration)
 
 
 def select_clips_for_video(
@@ -1934,7 +2337,7 @@ def select_clips_for_video(
     if duration <= 90:
         return complete_short_clip(segments, duration)
     config = preset_config_for_export(preset)
-    selected = shorts_director.select_dynamic_clips(
+    selected = clip_selection.select_dynamic_clips(
         segments,
         duration,
         audio_path=audio_path,
@@ -1947,18 +2350,11 @@ def select_clips_for_video(
         episode_profile_builder=request_dynamic_episode_profile,
         allow_fallback=False,
     )
-    if clip_selection.viral_timestamp_engine_v2_enabled():
-        return selected
-    return selected or shorts_director.select_director_clips(
-        segments,
-        duration=duration,
-        ai_model=ai_model,
-        preset=config,
-    )
+    return selected
 
 
 def fallback_clips(duration: float, count: int = 5) -> list[dict]:
-    return shorts_director.fallback_clips(duration, count=count)
+    raise RuntimeError("Legacy clip fallback has been removed. Use the V2 timestamp engine.")
 
 # ---------------------------------------------------------------------------
 # SRT generation
@@ -2273,6 +2669,10 @@ def _process_video_sync(
             step(0, "error", "Could not determine video duration.")
             raise ValueError("Could not determine video duration.")
         step(0, "done", f"{duration:.0f}s")
+        db_write(
+            "UPDATE videos SET source_duration=?, updated_at=datetime('now') WHERE id=?",
+            (duration, video_id),
+        )
         ensure_not_cancelled(video_id)
 
         rows = db_read(
@@ -2296,67 +2696,31 @@ def _process_video_sync(
         ensure_not_cancelled(video_id)
 
         # ── Step 2: Transcribe ───────────────────────────────────────────────
+        caption_transcript: Optional[dict] = None
         if audio_ok:
-            step(2, "running", "Trying local Whisper CLI…")
-            segs = transcribe_with_whisper_local(audio_path, video_id=video_id)
-            if segs:
-                segments = segs
-                step(2, "done", f"Local Whisper — {len(segments)} segments")
-            elif ai_model == "groq":
-                if not GROQ_API_KEY:
-                    step(
-                        2, "error", "GROQ_API_KEY not configured — using fallback spacing")
-                else:
-                    groq_detail = "Groq Whisper chunked..." if should_chunk_groq_audio(audio_path) else "Groq Whisper..."
-                    step(2, "running", groq_detail)
-                    loop = asyncio.new_event_loop()
-                    try:
-                        segs = loop.run_until_complete(
-                            transcribe_with_groq_api(audio_path, video_id=video_id))
-                    except RuntimeError as exc:
-                        segs = None
-                        step(2, "error", str(exc))
-                    finally:
-                        loop.close()
-                    if segs:
-                        segments = segs
-                        step(2, "done", f"Groq — {len(segments)} segments")
-                    elif steps[2]["status"] != "error":
-                        step(
-                            2, "error", "Groq returned no segments — using fallback spacing")
-            elif ai_model == "gemini" and GEMINI_API_KEY:
-                step(2, "running", "Gemini Flash…")
-                loop = asyncio.new_event_loop()
-                try:
-                    segs = loop.run_until_complete(
-                        transcribe_with_gemini(audio_path))
-                except RuntimeError as exc:
-                    segs = None
-                    step(2, "error", str(exc))
-                finally:
-                    loop.close()
-                if segs:
-                    segments = segs
-                    step(2, "done", f"Gemini — {len(segments)} segments")
-                elif steps[2]["status"] != "error":
-                    step(
-                        2, "error", "Gemini returned no segments — using fallback spacing")
-            elif OPENAI_API_KEY:
-                step(2, "running", "OpenAI Whisper API…")
-                loop = asyncio.new_event_loop()
-                try:
-                    segs = loop.run_until_complete(
-                        transcribe_with_openai_api(audio_path))
-                finally:
-                    loop.close()
-                if segs:
-                    segments = segs
-                    step(2, "done", f"OpenAI — {len(segments)} segments")
-                else:
-                    step(2, "error", "API returned no segments — using fallback spacing")
+            step(2, "running", "Deepgram captions..." if DEEPGRAM_API_KEY else "Transcribing audio...")
+            caption_transcript = transcribe_audio_for_captions(
+                audio_path,
+                ai_model=ai_model,
+                video_id=video_id,
+            )
+            if caption_transcript and caption_transcript.get("segments"):
+                segments = caption_transcript["segments"]
+                provider = caption_transcript.get("provider") or "transcription"
+                model = caption_transcript.get("model") or ""
+                confidence = float(caption_transcript.get("confidence") or 0)
+                word_count = len(caption_transcript.get("words") or [])
+                detail = f"{provider}"
+                if model:
+                    detail += f" {model}"
+                detail += f" — {len(segments)} segments"
+                if word_count:
+                    detail += f", {word_count} words"
+                if confidence:
+                    detail += f", avg confidence {int(confidence * 100)}%"
+                step(2, "done", detail)
             else:
-                step(
-                    2, "error", "No transcription key configured — using fallback spacing")
+                step(2, "error", "All transcription providers returned no usable segments.")
         else:
             step(2, "error", "Skipped (audio extraction failed)")
         ensure_not_cancelled(video_id)
@@ -2390,8 +2754,23 @@ def _process_video_sync(
             ensure_not_cancelled(video_id)
             start, end = clip["start"], clip["end"]
             clip_dur = end - start
-            srt_content = generate_srt(
-                segments, start, end) if captions_enabled and segments else ""
+            caption_cues = []
+            caption_words = []
+            srt_content = ""
+            if captions_enabled and segments:
+                caption_cues = caption_line_builder.build_caption_cues(
+                    segments,
+                    start,
+                    end,
+                )
+                srt_content = caption_export.generate_srt_from_cues(caption_cues)
+                caption_words = [
+                    word for word in (caption_transcript or {}).get("words", [])
+                    if float(word.get("end", word.get("start", 0))) > start
+                    and float(word.get("start", 0)) < end
+                ]
+                if not srt_content.strip():
+                    srt_content = generate_srt(segments, start, end)
             srt_path = None
             if srt_content.strip():
                 srt_path = str(OUTPUTS_DIR / f"{safe_id}_short_{idx:02d}.srt")
@@ -2416,15 +2795,18 @@ def _process_video_sync(
                     "(video_id, filename, start_time, end_time, duration, caption_text, title, description, "
                     "virality_score, completion_score, hook_type, selection_reason, status, "
                     "original_start_time, original_end_time, upload_title, upload_description, "
-                    "timestamp_engine, candidate_source, final_score, score_details_json, judge_status, updated_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))",
+                    "timestamp_engine, candidate_source, final_score, score_details_json, judge_status, "
+                    "caption_provider, caption_model, caption_language, caption_confidence, "
+                    "caption_words_json, caption_cues_json, caption_srt, caption_status, updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))",
                     (
                         video_id,
                         out_filename,
                         start,
                         end,
                         clip_dur,
-                        enriched_clip.get("text", "")[:500],
+                        (" ".join(cue.get("text", "") for cue in caption_cues).strip()
+                         or enriched_clip.get("text", ""))[:500],
                         title,
                         description,
                         int(enriched_clip.get("virality_score", 0) or 0),
@@ -2441,6 +2823,14 @@ def _process_video_sync(
                         float(enriched_clip.get("final_score", 0) or 0),
                         enriched_clip.get("score_details_json", "")[:4000],
                         enriched_clip.get("judge_status", "")[:30],
+                        (caption_transcript or {}).get("provider", "")[:40],
+                        (caption_transcript or {}).get("model", "")[:80],
+                        (caption_transcript or {}).get("language", "")[:80],
+                        float((caption_transcript or {}).get("confidence", 0) or 0),
+                        json.dumps(caption_words)[:12000],
+                        json.dumps(caption_cues)[:12000],
+                        srt_content,
+                        (caption_transcript or {}).get("status", "")[:40],
                     ),
                 )
                 generated += 1
@@ -2581,6 +2971,7 @@ async def download_and_process(video_id: int, captions_enabled: bool = True):
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
+    await backfill_missing_video_durations()
     videos = db_read("SELECT * FROM videos ORDER BY created_at DESC")
     for v in videos:
         try:
@@ -2591,12 +2982,17 @@ async def dashboard(request: Request):
             "SELECT * FROM shorts WHERE video_id=? ORDER BY start_time", (
                 v["id"],)
         ))
+        v["source_kind"] = classify_source_video(v)
+    long_videos = [v for v in videos if v["source_kind"] == "long"]
+    short_videos = [v for v in videos if v["source_kind"] == "short"]
     ch_id = effective_channel_id()
     response = templates.TemplateResponse(
         request,
         "index.html",
         context={
             "videos": videos,
+            "long_videos": long_videos,
+            "short_videos": short_videos,
             "channel_id": ch_id or "Not configured",
             "ai_model": effective_ai_model(),
             "has_youtube_key": bool(YOUTUBE_API_KEY),
@@ -2700,21 +3096,68 @@ async def check_youtube():
 
     added = 0
     for upload in uploads:
+        source_duration = upload.get("source_duration")
         if not db_read("SELECT id FROM videos WHERE youtube_video_id=?", (upload["youtube_video_id"],)):
             db_write(
-                "INSERT INTO videos (youtube_video_id, title, description, published_at, thumbnail, status) VALUES (?,?,?,?,?,'detected')",
+                "INSERT INTO videos (youtube_video_id, title, description, published_at, thumbnail, source_duration, status) "
+                "VALUES (?,?,?,?,?,?,'detected')",
                 (upload["youtube_video_id"], upload["title"],
-                 upload.get("description", ""), upload["published_at"], upload.get("thumbnail", "")),
+                 upload.get("description", ""), upload["published_at"],
+                 upload.get("thumbnail", ""), source_duration),
             )
             added += 1
         else:
             # Update thumbnail if missing
             db_write(
-                "UPDATE videos SET description=COALESCE(NULLIF(description,''), ?), thumbnail=CASE WHEN thumbnail IS NULL OR thumbnail='' THEN ? ELSE thumbnail END WHERE youtube_video_id=?",
-                (upload.get("description", ""), upload.get("thumbnail", ""), upload["youtube_video_id"]),
+                "UPDATE videos SET description=COALESCE(NULLIF(description,''), ?), "
+                "thumbnail=CASE WHEN thumbnail IS NULL OR thumbnail='' THEN ? ELSE thumbnail END, "
+                "source_duration=COALESCE(?, source_duration), updated_at=datetime('now') "
+                "WHERE youtube_video_id=?",
+                (upload.get("description", ""), upload.get("thumbnail", ""),
+                 source_duration, upload["youtube_video_id"]),
             )
 
+    await backfill_missing_video_durations()
+
     return {"detected": len(uploads), "new": added, "uploads": uploads}
+
+
+@app.post("/youtube-url")
+async def download_youtube_url_route(background_tasks: BackgroundTasks, request: Request):
+    """Create or reuse a video row from a pasted YouTube URL and process it."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    yt_id = extract_youtube_video_id(str(body.get("url", "")))
+    if not yt_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Paste a valid YouTube video, Shorts, or youtu.be URL.",
+        )
+
+    rows = db_read("SELECT * FROM videos WHERE youtube_video_id=?", (yt_id,))
+    if rows:
+        video = rows[0]
+        if video["status"] in ("processing", "downloading"):
+            raise HTTPException(status_code=409, detail="Already in progress.")
+        video_id = video["id"]
+        db_write(
+            "UPDATE videos SET error_message=NULL, steps_json=NULL, updated_at=datetime('now') WHERE id=?",
+            (video_id,),
+        )
+    else:
+        db_write(
+            "INSERT INTO videos (youtube_video_id, title, status) VALUES (?,?,'detected')",
+            (yt_id, f"YouTube video {yt_id}"),
+        )
+        video_id = db_read(
+            "SELECT id FROM videos WHERE youtube_video_id=?", (yt_id,))[0]["id"]
+
+    background_tasks.add_task(
+        download_and_process, video_id, captions_enabled_from_body(body))
+    return {"message": "Download and clipping started.", "video_id": video_id}
 
 
 @app.post("/upload-source/{video_id}")
@@ -2742,9 +3185,10 @@ async def upload_source(video_id: int, file: UploadFile = File(...)):
         raise HTTPException(
             status_code=400, detail="Uploaded file is not a valid video.")
 
+    source_duration = get_video_duration(str(dest))
     db_write(
-        "UPDATE videos SET source_path=?, status='waiting', updated_at=datetime('now') WHERE id=?",
-        (str(dest), video_id),
+        "UPDATE videos SET source_path=?, source_duration=?, status='waiting', updated_at=datetime('now') WHERE id=?",
+        (str(dest), source_duration, video_id),
     )
     return {"message": "Source file uploaded successfully.", "path": str(dest)}
 
@@ -2815,6 +3259,15 @@ async def update_short_metadata_route(short_id: int, request: Request):
         return {"short": update_short_metadata(short_id, await request.json())}
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.post("/short/{short_id}/captions")
+async def update_short_captions_route(short_id: int, request: Request):
+    try:
+        body = await request.json()
+        return {"short": update_short_captions(short_id, body.get("cues") or [])}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.post("/short/{short_id}/status")
@@ -3026,6 +3479,17 @@ async def delete_source_video_route(video_id: int):
         raise HTTPException(
             status_code=404, detail="Downloaded video not found.")
     return {"message": "Downloaded video deleted."}
+
+
+@app.delete("/video/{video_id}")
+async def delete_video_route(video_id: int):
+    try:
+        deleted = delete_video_record(video_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Video not found.")
+    return {"message": "Video removed from list."}
 
 
 @app.post("/webhooks/youtube")

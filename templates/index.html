@@ -194,6 +194,19 @@
 
   <!-- ===================== CONTROL BAR ===================== -->
   <div class="control-bar">
+    <div class="youtube-url-row">
+      <input
+        type="url"
+        id="youtube-url-input"
+        class="field-input youtube-url-input"
+        placeholder="Paste a YouTube video or Shorts URL"
+        onkeydown="if(event.key === 'Enter') downloadYoutubeUrl()"
+      />
+      <button class="btn btn-primary" id="btn-youtube-url" onclick="downloadYoutubeUrl(this)">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        Download &amp; Generate
+      </button>
+    </div>
     <button class="btn btn-primary" id="btn-check-youtube" onclick="checkYoutube()">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22.54 6.42a2.78 2.78 0 0 0-1.95-1.95C18.88 4 12 4 12 4s-6.88 0-8.59.47A2.78 2.78 0 0 0 1.46 6.42 29 29 0 0 0 1 12a29 29 0 0 0 .46 5.58 2.78 2.78 0 0 0 1.95 1.95C5.12 20 12 20 12 20s6.88 0 8.59-.47a2.78 2.78 0 0 0 1.95-1.95A29 29 0 0 0 23 12a29 29 0 0 0-.46-5.58z"/><polygon points="9.75 15.02 15.5 12 9.75 8.98 9.75 15.02"/></svg>
       Check YouTube Uploads
@@ -205,10 +218,52 @@
   </div>
 
   <!-- ===================== VIDEOS ===================== -->
-  <p class="section-title">Your Videos ({{ videos|length }})</p>
+  <div class="video-section-header">
+    <p class="section-title">Your Videos ({{ videos|length }})</p>
+    <div class="video-tabs" role="tablist" aria-label="Video type">
+      <button
+        type="button"
+        class="video-tab active"
+        id="video-tab-long"
+        role="tab"
+        aria-selected="true"
+        aria-controls="video-panel-long"
+        onclick="switchVideoTab('long')"
+      >
+        Long Form ({{ (long_videos|default([]))|length }})
+      </button>
+      <button
+        type="button"
+        class="video-tab"
+        id="video-tab-short"
+        role="tab"
+        aria-selected="false"
+        aria-controls="video-panel-short"
+        onclick="switchVideoTab('short')"
+      >
+        Shorts ({{ (short_videos|default([]))|length }})
+      </button>
+    </div>
+  </div>
+
+  <div class="video-tab-empty" id="video-empty-long" style="display:{% if long_videos|default([]) %}none{% else %}block{% endif %}">
+    <div class="empty-state">
+      <div class="empty-state-icon">🎬</div>
+      <h3>No long-form videos yet</h3>
+      <p>Long YouTube uploads appear here automatically after you scan your channel.</p>
+    </div>
+  </div>
+
+  <div class="video-tab-empty" id="video-empty-short" style="display:none">
+    <div class="empty-state">
+      <div class="empty-state-icon">📱</div>
+      <h3>No short-form videos yet</h3>
+      <p>YouTube Shorts (3 minutes or less) are sorted into this tab automatically.</p>
+    </div>
+  </div>
 
   {% if not videos %}
-  <div class="empty-state">
+  <div class="empty-state" id="video-empty-all">
     <div class="empty-state-icon">📺</div>
     <h3>No videos detected yet</h3>
     <p>Click "Check YouTube Uploads" to scan your channel, or configure your channel ID in Settings above.</p>
@@ -217,7 +272,7 @@
 
   <div class="video-list" id="video-list">
     {% for video in videos %}
-    <div class="video-card" id="card-{{ video.id }}">
+    <div class="video-card" id="card-{{ video.id }}" data-source-kind="{{ video.source_kind|default('long') }}">
 
       <div class="video-card-header">
         {% if video.thumbnail %}
@@ -250,6 +305,12 @@
             <span class="caption-toggle-ui" aria-hidden="true"></span>
             <span>Captions</span>
           </label>
+
+          {% if video.status not in ('processing', 'downloading') %}
+          <button class="btn btn-danger btn-sm btn-icon" title="Remove video from list" aria-label="Remove video from list" onclick="deleteVideoRecord({{ video.id }}, this)">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+          </button>
+          {% endif %}
 
           {% if video.status == 'detected' or (video.status == 'failed' and not video.source_path) %}
           <button class="btn btn-primary btn-sm" id="dl-btn-{{ video.id }}" onclick="downloadAndProcess({{ video.id }}, this)">
@@ -370,16 +431,16 @@
               {% if has_v2_score %}
               <span class="score-pill">Score {{ (short.final_score * 100)|round|int }}%</span>
               {% endif %}
+              {% if short.caption_provider is defined and short.caption_provider %}
+              <span class="score-pill">Captions {{ short.caption_provider }}</span>
+              {% endif %}
+              {% if short.caption_status is defined and short.caption_status %}
+              <span class="score-pill">{{ short.caption_status }}</span>
+              {% endif %}
             </div>
             {% endif %}
             {% if short.selection_reason %}
             <div class="short-reason">{{ short.selection_reason }}</div>
-            {% endif %}
-            {% if short.score_details_json is defined and short.score_details_json %}
-            <details class="engine-log engine-log-short">
-              <summary>V2 Engine Log</summary>
-              <pre>{{ short.score_details_json }}</pre>
-            </details>
             {% endif %}
             <div style="display:flex;gap:0.4rem;flex-wrap:wrap;margin-top:0.25rem">
               <button class="btn btn-primary btn-sm" onclick='openShortPlayer({{ short.filename|tojson }})'>
@@ -453,6 +514,6 @@
 </div>
 
 <div id="toast-area"></div>
-<script src="/static/app.js?v=12"></script>
+<script src="/static/app.js?v=13"></script>
 </body>
 </html>

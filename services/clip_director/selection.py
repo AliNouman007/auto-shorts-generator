@@ -1,5 +1,4 @@
 import json
-import os
 from collections.abc import Callable
 
 from services import shorts_director
@@ -37,7 +36,7 @@ def constraints_for_mode(mode: str | None) -> ClipConstraints:
 
 
 def viral_timestamp_engine_v2_enabled() -> bool:
-    return os.environ.get("VIRAL_TIMESTAMP_ENGINE_V2", "true").strip().lower() not in {"0", "false", "no", "off"}
+    return True
 
 
 def target_v2_clip_count(duration: float) -> int:
@@ -447,38 +446,7 @@ def select_dynamic_clips_v2(
 
 
 def fallback_dynamic_clips(episode_map: EpisodeMap, constraints: ClipConstraints) -> list[dict]:
-    moments = episode_map.get("candidate_moments", [])
-    segments = episode_map.get("segments", [])
-    candidates = []
-    for idx, moment in enumerate(moments, start=1):
-        candidates.append({
-            **moment,
-            "title": f"High Energy Moment {idx}",
-            "virality_score": 75 + min(20, int(float(moment.get("audio_peak_energy", 0)) * 20)),
-            "completion_score": 75,
-            "hook_type": "emotional",
-            "selection_reason": "Selected from an audio energy peak and expanded to nearby transcript context.",
-        })
-    if not candidates and segments:
-        candidates = shorts_director.build_director_candidates(
-            segments,
-            duration=float(episode_map.get("duration", 0)),
-            preset={
-                "min_clip_duration": constraints["min_duration"],
-                "preferred_max_clip_duration": min(180, constraints["max_duration"]),
-                "hard_max_clip_duration": constraints["max_duration"],
-                "allow_three_minute_shorts": constraints["max_duration"] > 180,
-            },
-            limit=constraints["safety_max_clips"],
-        )
-    valid = [
-        clip for clip in (
-            _coerce_clip(candidate, episode_map, constraints) for candidate in candidates
-        )
-        if clip
-    ]
-    valid.sort(key=lambda item: (item.get("has_audio_peak", False), item.get("virality_score", 0)), reverse=True)
-    return _dedupe(valid, constraints["safety_max_clips"])
+    raise RuntimeError("Legacy dynamic fallback has been removed. Use select_dynamic_clips V2.")
 
 
 def select_dynamic_clips(
@@ -499,41 +467,16 @@ def select_dynamic_clips(
 ) -> list[dict]:
     if not segments:
         return []
-    use_v2_engine = viral_timestamp_engine_v2_enabled() if use_v2 is None else use_v2
-    if use_v2_engine:
-        return select_dynamic_clips_v2(
-            segments,
-            duration,
-            audio_path=audio_path,
-            audio_peaks=audio_peaks,
-            video_title=video_title,
-            video_description=video_description,
-            mode=mode,
-            genre_hint=genre_hint,
-            ai_model=ai_model,
-            llm_selector=llm_selector,
-            episode_profile_builder=episode_profile_builder,
-        )
-    normalized_mode = normalize_mode(mode)
-    constraints = constraints_for_mode(normalized_mode)
-    peaks = audio_peaks if audio_peaks is not None else analyze_audio_peaks(audio_path)
-    episode_map = build_episode_map(
-        segments=segments,
-        duration=duration,
-        audio_peaks=peaks,
-        title=video_title,
-        mode=normalized_mode,
+    return select_dynamic_clips_v2(
+        segments,
+        duration,
+        audio_path=audio_path,
+        audio_peaks=audio_peaks,
+        video_title=video_title,
+        video_description=video_description,
+        mode=mode,
         genre_hint=genre_hint,
+        ai_model=ai_model,
+        llm_selector=llm_selector,
+        episode_profile_builder=episode_profile_builder,
     )
-    selections = llm_selector(episode_map, constraints, ai_model) if llm_selector else []
-    clips = [
-        clip for clip in (
-            _coerce_clip(selection, episode_map, constraints) for selection in selections
-        )
-        if clip
-    ]
-    if clips:
-        return _dedupe(clips, constraints["safety_max_clips"])
-    if not allow_fallback:
-        return []
-    return fallback_dynamic_clips(episode_map, constraints)

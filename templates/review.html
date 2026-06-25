@@ -55,21 +55,9 @@
           <span>Title</span>
           <input id="review-title" value="{{ short.title or '' }}" />
         </label>
-        <label class="form-field">
-          <span>Upload Title</span>
-          <input id="review-upload-title" value="{{ short.upload_title or short.title or '' }}" />
-        </label>
         <label class="form-field full">
           <span>Description</span>
-          <textarea id="review-description" rows="3">{{ short.description or '' }}</textarea>
-        </label>
-        <label class="form-field full">
-          <span>Upload Description</span>
-          <textarea id="review-upload-description" rows="3">{{ short.upload_description or short.description or '' }}</textarea>
-        </label>
-        <label class="form-field full">
-          <span>Captions</span>
-          <textarea id="review-caption" rows="6">{{ short.caption_text or '' }}</textarea>
+          <textarea id="review-description" rows="4">{{ short.description or short.upload_description or '' }}</textarea>
         </label>
         <label class="form-field">
           <span>Start</span>
@@ -98,14 +86,11 @@
         {% if short.candidate_source is defined and short.candidate_source %}<span>Source {{ short.candidate_source }}</span>{% endif %}
         {% if has_v2_score %}<span>Score {{ (short.final_score * 100)|round|int }}%</span>{% endif %}
         {% if short.judge_status is defined and short.judge_status %}<span>Judge {{ short.judge_status }}</span>{% endif %}
+        {% if short.caption_provider is defined and short.caption_provider %}<span>Captions {{ short.caption_provider }}</span>{% endif %}
+        {% if short.caption_language is defined and short.caption_language %}<span>Language {{ short.caption_language }}</span>{% endif %}
+        {% if short.caption_confidence is defined and short.caption_confidence %}<span>Confidence {{ (short.caption_confidence * 100)|round|int }}%</span>{% endif %}
+        {% if short.caption_status is defined and short.caption_status %}<span>{{ short.caption_status }}</span>{% endif %}
       </div>
-
-      {% if short.score_details_json is defined and short.score_details_json %}
-      <details class="engine-log">
-        <summary>V2 Engine Log</summary>
-        <pre>{{ short.score_details_json }}</pre>
-      </details>
-      {% endif %}
 
       {% if short.latest_upload %}
       <div class="upload-summary">

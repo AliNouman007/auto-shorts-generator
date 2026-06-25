@@ -449,6 +449,45 @@ async function downloadAndProcess(videoId, btn) {
   }
 }
 
+async function downloadYoutubeUrl(btn) {
+  const input = document.getElementById("youtube-url-input");
+  const button = btn || document.getElementById("btn-youtube-url");
+  const url = (input?.value || "").trim();
+  if (!url) {
+    showToast("Paste a YouTube URL first", "error");
+    input?.focus();
+    return;
+  }
+
+  button.disabled = true;
+  button.innerHTML = '<span class="spin"></span> Starting...';
+
+  try {
+    const res = await fetch("/youtube-url", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url, captions_enabled: true }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      showToast(data.detail || "Could not start YouTube download", "error");
+      return;
+    }
+    showToast("Download and clipping started.", "success");
+    if (input) input.value = "";
+    setTimeout(() => location.reload(), 700);
+  } catch (err) {
+    showToast("Network error: " + err.message, "error");
+  } finally {
+    button.disabled = false;
+    button.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+      <polyline points="7 10 12 15 17 10"/>
+      <line x1="12" y1="15" x2="12" y2="3"/></svg>
+      Download & Generate`;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Upload zone (manual file upload)
 // ---------------------------------------------------------------------------
@@ -560,8 +599,6 @@ async function cancelVideo(videoId, btn) {
 }
 
 async function deleteShort(shortId, btn) {
-  if (!confirm("Delete this generated Short?")) return;
-
   btn.disabled = true;
   btn.textContent = "Deleting…";
 
@@ -584,13 +621,6 @@ async function deleteShort(shortId, btn) {
 }
 
 async function deleteSourceVideo(videoId, btn) {
-  if (
-    !confirm(
-      "Delete the downloaded source video and generated Shorts for this item?",
-    )
-  )
-    return;
-
   btn.disabled = true;
   btn.textContent = "Deleting…";
 
@@ -609,6 +639,32 @@ async function deleteSourceVideo(videoId, btn) {
     showToast("Network error deleting video: " + err.message, "error");
     btn.disabled = false;
     btn.textContent = "Delete Video";
+  }
+}
+
+async function deleteVideoRecord(videoId, btn) {
+  if (!confirm("Remove this video and all of its generated Shorts from the list?")) return;
+
+  btn.disabled = true;
+  const originalHtml = btn.innerHTML;
+  btn.innerHTML = '<span class="spin"></span>';
+
+  try {
+    const res = await fetch(`/video/${videoId}`, { method: "DELETE" });
+    const data = await res.json();
+    if (!res.ok) {
+      showToast(data.detail || "Could not remove video", "error");
+      btn.disabled = false;
+      btn.innerHTML = originalHtml;
+      return;
+    }
+    showToast("Video removed from list.", "success");
+    document.getElementById(`card-${videoId}`)?.remove();
+    setTimeout(() => location.reload(), 500);
+  } catch (err) {
+    showToast("Network error removing video: " + err.message, "error");
+    btn.disabled = false;
+    btn.innerHTML = originalHtml;
   }
 }
 
@@ -679,13 +735,13 @@ function escJsString(s) {
 }
 
 function collectReviewMetadata() {
+  const title = document.getElementById("review-title")?.value || "";
+  const description = document.getElementById("review-description")?.value || "";
   return {
-    title: document.getElementById("review-title")?.value || "",
-    upload_title: document.getElementById("review-upload-title")?.value || "",
-    description: document.getElementById("review-description")?.value || "",
-    upload_description:
-      document.getElementById("review-upload-description")?.value || "",
-    caption_text: document.getElementById("review-caption")?.value || "",
+    title,
+    upload_title: title,
+    description,
+    upload_description: description,
   };
 }
 
@@ -872,9 +928,6 @@ function renderShortCard(short) {
     Number(short.final_score) > 0
       ? `<span class="score-pill">Score ${Math.round(Number(short.final_score) * 100)}%</span>`
       : "";
-  const engineLog = short.score_details_json
-    ? `<details class="engine-log engine-log-short"><summary>V2 Engine Log</summary><pre>${escHtml(short.score_details_json)}</pre></details>`
-    : "";
   const scores =
     virality || completion || hook || timestampEngine || candidateSource || finalScore
       ? `<div class="short-score-row">${virality}${completion}${hook}${timestampEngine}${candidateSource}${finalScore}</div>`
@@ -898,7 +951,6 @@ function renderShortCard(short) {
     <div class="short-meta">${duration}${range}</div>
     ${scores}
     ${reason}
-    ${engineLog}
     <div style="display:flex;gap:0.4rem;flex-wrap:wrap;margin-top:0.25rem">
       <button class="btn btn-primary btn-sm" onclick="openShortPlayer('${escJsString(short.filename || "")}')">
         <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 3 20 12 6 21 6 3"/></svg>
@@ -1049,10 +1101,70 @@ function updateStatusBadge(videoId, status) {
 }
 
 // ---------------------------------------------------------------------------
+// Video tabs (long form vs shorts)
+// ---------------------------------------------------------------------------
+
+const VIDEO_TAB_STORAGE_KEY = "asg-video-tab";
+
+function switchVideoTab(kind) {
+  const list = document.getElementById("video-list");
+  const longTab = document.getElementById("video-tab-long");
+  const shortTab = document.getElementById("video-tab-short");
+  const emptyLong = document.getElementById("video-empty-long");
+  const emptyShort = document.getElementById("video-empty-short");
+  if (!list || !longTab || !shortTab) return;
+
+  const isShort = kind === "short";
+  list.classList.toggle("show-shorts", isShort);
+  longTab.classList.toggle("active", !isShort);
+  shortTab.classList.toggle("active", isShort);
+  longTab.setAttribute("aria-selected", String(!isShort));
+  shortTab.setAttribute("aria-selected", String(isShort));
+
+  const longCount = list.querySelectorAll('.video-card[data-source-kind="long"]').length;
+  const shortCount = list.querySelectorAll('.video-card[data-source-kind="short"]').length;
+  const activeCount = isShort ? shortCount : longCount;
+
+  if (emptyLong) emptyLong.style.display = !isShort && longCount === 0 ? "block" : "none";
+  if (emptyShort) emptyShort.style.display = isShort && shortCount === 0 ? "block" : "none";
+  list.style.display = activeCount > 0 ? "flex" : "none";
+
+  try {
+    sessionStorage.setItem(VIDEO_TAB_STORAGE_KEY, kind);
+  } catch (e) {
+    // Ignore storage errors in restricted environments.
+  }
+}
+
+function initVideoTabs() {
+  const list = document.getElementById("video-list");
+  if (!list || !list.querySelector(".video-card")) return;
+
+  let saved = "long";
+  try {
+    saved = sessionStorage.getItem(VIDEO_TAB_STORAGE_KEY) || "long";
+  } catch (e) {
+    saved = "long";
+  }
+
+  const longCount = list.querySelectorAll('.video-card[data-source-kind="long"]').length;
+  const shortCount = list.querySelectorAll('.video-card[data-source-kind="short"]').length;
+  if (saved === "long" && longCount === 0 && shortCount > 0) {
+    saved = "short";
+  } else if (saved === "short" && shortCount === 0 && longCount > 0) {
+    saved = "long";
+  }
+
+  switchVideoTab(saved === "short" ? "short" : "long");
+}
+
+// ---------------------------------------------------------------------------
 // Auto-poll cards in 'processing' or 'downloading' state on page load
 // ---------------------------------------------------------------------------
 
 document.addEventListener("DOMContentLoaded", () => {
+  initVideoTabs();
+
   // Poll for video processing status
   document.querySelectorAll('[id^="status-"]').forEach((badge) => {
     const txt = badge.textContent.trim();

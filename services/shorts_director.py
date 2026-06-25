@@ -388,20 +388,7 @@ def select_director_clips(
     ai_model: str,
     preset: dict | None = None,
 ) -> list[dict]:
-    if not segments:
-        return []
-    config = normalize_director_preset(preset)
-    if duration <= 90:
-        return complete_short_clip(segments, duration)
-    target_count = target_clip_count_for_duration(duration)
-    candidates = build_director_candidates(
-        segments,
-        duration=duration,
-        preset=config,
-        limit=max(20, target_count * 5),
-    )
-    ranked = rank_candidates_fallback(candidates, target_count=target_count)
-    return finalize_director_clips(ranked, segments, duration, config, target_count)
+    raise RuntimeError("Legacy clip selection has been removed. Use services.clip_director.selection.")
 
 
 def target_clip_count_for_duration(duration: float) -> int:
@@ -493,7 +480,8 @@ def enrich_clip_metadata(clip: dict) -> dict:
     value = str(clip.get("value") or (" ".join(middle).strip() if middle else payoff)).strip()
     title = _clean_title(clip.get("title") or hook or "Strong Short Moment")
     upload_title = _clean_upload_title(clip.get("upload_title") or title)
-    description = str(clip.get("description") or _description_from_parts(hook, value, payoff)).strip()[:500]
+    hook_type = _clean_hook_type(clip.get("hook_type") or "story")
+    description = str(clip.get("description") or _description_from_parts(title, hook_type)).strip()[:500]
     upload_description = str(
         clip.get("upload_description") or _upload_description(description, clip.get("hook_type"), text)
     ).strip()[:700]
@@ -516,7 +504,7 @@ def enrich_clip_metadata(clip: dict) -> dict:
         "context": context[:300],
         "value": value[:400],
         "payoff": payoff[:260],
-        "hook_type": _clean_hook_type(clip.get("hook_type") or "story"),
+        "hook_type": hook_type,
         "virality_score": clamp_score(float(clip.get("virality_score", 60)) + (clip.get("audio_peak_energy", 0) * 30)),
         "completion_score": clamp_score(float(clip.get("completion_score", 70))),
         "selection_reason": selection_reason,
@@ -599,12 +587,23 @@ def _clean_hook_type(hook_type: str | None) -> str:
     return hook_type if hook_type in HOOK_TYPES else "story"
 
 
-def _description_from_parts(hook: str, value: str, payoff: str) -> str:
-    parts = [part for part in (hook, value, payoff) if part]
-    if not parts:
-        return "A focused Short with one clear idea and payoff."
-    description = " ".join(parts[:2])
-    return description[:500]
+def _description_from_parts(title: str, hook_type: str | None) -> str:
+    title = _clean_title(title)
+    kind = _clean_hook_type(hook_type)
+    if kind == "comedy":
+        return (
+            f"A funny short highlight: {title}. "
+            "Selected for its setup, punchline, and reaction."
+        )
+    if kind in {"question", "problem_solution", "educational"}:
+        return (
+            f"A focused short highlight: {title}. "
+            "Selected for its clear hook, useful context, and payoff."
+        )
+    return (
+        f"A standout short moment: {title}. "
+        "Selected for its clear hook and strong payoff."
+    )
 
 
 def _upload_description(description: str, hook_type: str | None, text: str) -> str:
@@ -628,53 +627,12 @@ def _upload_description(description: str, hook_type: str | None, text: str) -> s
 
 
 def complete_short_clip(segments: list[dict], duration: float) -> list[dict]:
-    text = " ".join(
-        str(seg.get("text", "")).strip()
-        for seg in segments
-        if str(seg.get("text", "")).strip()
-    )
-    reason = "The source video is already short, so it is kept as one complete clip and not being split."
-    return [enrich_clip_metadata({
-        "start": 0,
-        "end": duration,
-        "duration": duration,
-        "text": text,
-        "title": "Complete short",
-        "virality_score": 65 if text else 50,
-        "completion_score": 90,
-        "hook_type": "complete_short",
-        "selection_reason": reason,
-        "reason": reason,
-    })]
+    raise RuntimeError("Legacy complete-short clip logic has been removed. Use complete_short_clip_v2.")
 
 
 def fallback_clips(duration: float, count: int = 8) -> list[dict]:
-    if duration <= 90:
-        return complete_short_clip([], duration)
-    clip_duration = 120.0
-    skip_start = 60.0 if duration > 180 else 0.0
-    usable = duration - skip_start - 30
-    count = min(count, max(3, int(usable / 120)))
-    if usable < clip_duration:
-        count = max(1, int(usable // clip_duration)) or 1
-    step = usable / count
-    return [
-        enrich_clip_metadata({
-            "start": skip_start + i * step,
-            "end": min(skip_start + i * step + clip_duration, duration - 5),
-            "duration": min(clip_duration, duration - 5 - (skip_start + i * step)),
-            "text": "",
-            "title": f"Highlight {i + 1}",
-            "virality_score": 50,
-            "completion_score": 50,
-            "hook_type": "fallback",
-            "selection_reason": "Generated from fallback spacing",
-        })
-        for i in range(count)
-    ]
+    raise RuntimeError("Legacy fallback clips have been removed. Use the V2 timestamp engine.")
 
 
 def select_dynamic_clips(*args, **kwargs) -> list[dict]:
-    from services.clip_director.selection import select_dynamic_clips as _select_dynamic_clips
-
-    return _select_dynamic_clips(*args, **kwargs)
+    raise RuntimeError("Legacy dynamic clip wrapper has been removed. Use services.clip_director.selection.")
