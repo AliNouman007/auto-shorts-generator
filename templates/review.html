@@ -34,7 +34,9 @@
       <div class="review-actions">
         <a href="/download/{{ short.filename }}" class="btn btn-ghost" download>Download</a>
         {% if short.status == 'approved' %}
-        <button class="btn btn-primary" onclick="uploadShort({{ short.id }}, this)">Upload to YouTube</button>
+        <button class="btn btn-primary" onclick="uploadShort({{ short.id }}, 'youtube', this)">Upload to YouTube</button>
+        <button class="btn btn-secondary" onclick="prepareTikTok({{ short.id }}, this)">Prepare for TikTok</button>
+        <button class="btn btn-ghost" onclick="shareToSnapchat({{ short.id }}, this)">Share to Snapchat</button>
         {% endif %}
       </div>
     </section>
@@ -67,6 +69,18 @@
           <span>End</span>
           <input id="review-end" type="number" step="0.1" value="{{ short.end_time or 0 }}" />
         </label>
+        <label class="form-field checkbox-field">
+          <span>Top Badge</span>
+          <input id="review-series-badge-enabled" type="checkbox" {% if short.series_badge_enabled is not defined or short.series_badge_enabled != 0 %}checked{% endif %} />
+        </label>
+        <label class="form-field">
+          <span>Badge Label</span>
+          <input id="review-series-badge-label" maxlength="32" value="{{ short.series_badge_label or 'Funniest Moment' }}" />
+        </label>
+        <label class="form-field full">
+          <span>Badge Text</span>
+          <input id="review-series-badge-text" maxlength="80" value="{{ short.series_badge_text or '' }}" placeholder="India's Got Latent EP1 - Part 10/28" />
+        </label>
       </div>
 
       <div class="review-actions">
@@ -90,13 +104,14 @@
         {% if short.caption_language is defined and short.caption_language %}<span>Language {{ short.caption_language }}</span>{% endif %}
         {% if short.caption_confidence is defined and short.caption_confidence %}<span>Confidence {{ (short.caption_confidence * 100)|round|int }}%</span>{% endif %}
         {% if short.caption_status is defined and short.caption_status %}<span>{{ short.caption_status }}</span>{% endif %}
+        {% if short.series_badge_text is defined and short.series_badge_text %}<span>Top {{ short.series_badge_text }}</span>{% endif %}
       </div>
 
       {% if short.latest_upload %}
       <div class="upload-summary">
         <strong>Latest upload:</strong> {{ short.latest_upload.status }}
         {% if short.latest_upload.platform_url %}
-        · <a href="{{ short.latest_upload.platform_url }}" target="_blank" rel="noopener">Open on YouTube</a>
+        · <a href="{{ short.latest_upload.platform_url }}" target="_blank" rel="noopener">Open on {{ short.latest_upload.platform|capitalize }}</a>
         {% endif %}
         {% if short.latest_upload.error_message %}
         <div class="error-text">{{ short.latest_upload.error_message }}</div>

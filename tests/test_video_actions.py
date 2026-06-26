@@ -10,11 +10,13 @@ from services import shorts_director
 from services.captions import deepgram as deepgram_captions
 from services.captions import export as caption_export
 from services.captions import line_builder, normalization
+from services.overlays import series_badge
+from services.uploads import snapchat as snapchat_upload
 
 
 class ExportFilterTest(unittest.TestCase):
     def test_default_export_filter_preserves_full_frame_with_blurred_background(self):
-        vf = main.build_export_video_filter()
+        vf = main.build_export_video_filter(preset={"width": 1080, "height": 1920})
 
         self.assertIn("scale=1080:1920:force_original_aspect_ratio=increase", vf)
         self.assertIn("boxblur=30:1", vf)
@@ -35,6 +37,28 @@ class ExportFilterTest(unittest.TestCase):
         self.assertIn("FontSize=10", vf)
         self.assertNotIn("FontSize=12", vf)
 
+    def test_export_filter_adds_top_series_badge_when_configured(self):
+        vf = main.build_export_video_filter(preset={
+            "series_badge_enabled": True,
+            "series_badge_label": "Funniest Moment",
+            "series_badge_text": "India's Got Latent EP1 - Part 10/28",
+        })
+
+        self.assertIn("drawbox=", vf)
+        self.assertIn("drawtext=", vf)
+        self.assertIn("Funniest Moment", vf)
+        self.assertIn("India\\'s Got Latent EP1 - Part 10/28", vf)
+
+    def test_series_badge_drawtext_uses_fontfile_not_fontconfig_lookup(self):
+        vf = main.build_export_video_filter(preset={
+            "series_badge_enabled": True,
+            "series_badge_label": "Funniest Moment",
+            "series_badge_text": "India's Got Latent EP1 - Part 10/28",
+        })
+
+        self.assertIn("fontfile=", vf)
+        self.assertNotIn("drawtext=font='Arial'", vf)
+
     def test_export_short_clip_uses_faster_x264_settings(self):
         with mock.patch.object(main, "run_command") as run_command:
             run_command.return_value.returncode = 0
@@ -52,6 +76,31 @@ class ExportFilterTest(unittest.TestCase):
         self.assertIn("libx264", command)
         self.assertEqual("veryfast", command[command.index("-preset") + 1])
         self.assertEqual("24", command[command.index("-crf") + 1])
+
+
+class SeriesBadgeTest(unittest.TestCase):
+    def test_series_badge_uses_short_label_and_part_count(self):
+        badge = series_badge.build_series_badge(
+            "India's Got Latent EP1 full episode with judges",
+            part_number=10,
+            total_parts=28,
+            label="Funniest Moment",
+        )
+
+        self.assertTrue(badge["series_badge_enabled"])
+        self.assertEqual("Funniest Moment", badge["series_badge_label"])
+        self.assertEqual("India's Got Latent EP1 full episode - Part 10/28", badge["series_badge_text"])
+
+    def test_series_badge_stays_off_for_single_clip_video(self):
+        badge = series_badge.build_series_badge(
+            "Single short",
+            part_number=1,
+            total_parts=1,
+            label="Funniest Moment",
+        )
+
+        self.assertFalse(badge["series_badge_enabled"])
+        self.assertEqual("", badge["series_badge_text"])
 
 
 class YoutubeDownloadCommandTest(unittest.TestCase):
@@ -1503,6 +1552,47 @@ class ClipSelectionTest(unittest.TestCase):
         self.assertIn("\"hook\"", short["score_details_json"])
         self.assertEqual("accepted", short["judge_status"])
 
+    def test_processing_numbers_series_badges_by_source_timestamp(self):
+        source_path = main.UPLOADS_DIR / "unit_badge_order.mp4"
+        source_path.write_text("source")
+        main.db_write(
+            "INSERT INTO videos (youtube_video_id, title, source_path, status) VALUES (?,?,?,'waiting')",
+            ("unit_badge_order", "Chronological badge source", str(source_path)),
+        )
+        video_id = main.db_read(
+            "SELECT id FROM videos WHERE youtube_video_id=?",
+            ("unit_badge_order",),
+        )[0]["id"]
+        self.addCleanup(lambda: main.db_write("DELETE FROM shorts WHERE video_id=?", (video_id,)))
+        self.addCleanup(lambda: main.db_write("DELETE FROM videos WHERE id=?", (video_id,)))
+        self.addCleanup(lambda: source_path.unlink(missing_ok=True))
+
+        clips = [
+            {"start": 120, "end": 150, "duration": 30, "text": "Center payoff.", "title": "Center"},
+            {"start": 5, "end": 35, "duration": 30, "text": "Opening setup.", "title": "Opening"},
+            {"start": 220, "end": 250, "duration": 30, "text": "Later callback.", "title": "Later"},
+        ]
+        with (
+            mock.patch.object(main, "missing_tools_message", return_value=""),
+            mock.patch.object(main, "is_valid_video", return_value=True),
+            mock.patch.object(main, "get_video_duration", return_value=300),
+            mock.patch.object(main, "extract_audio", return_value=True),
+            mock.patch.object(main, "transcribe_with_whisper_local", return_value=clips),
+            mock.patch.object(main, "select_clips_for_video", return_value=clips),
+            mock.patch.object(main, "export_short_clip", return_value=True) as export_short_clip,
+        ):
+            main._process_video_sync(video_id, str(source_path), captions_enabled=False)
+
+        badge_texts = [call.kwargs["preset"]["series_badge_text"] for call in export_short_clip.call_args_list]
+        self.assertEqual(
+            [
+                "Chronological badge source - Part 2/3",
+                "Chronological badge source - Part 1/3",
+                "Chronological badge source - Part 3/3",
+            ],
+            badge_texts,
+        )
+
     def test_main_does_not_fall_back_to_legacy_selector_when_v2_returns_no_clips(self):
         with (
             mock.patch.object(main.clip_selection, "select_dynamic_clips", return_value=[]) as dynamic_selector,
@@ -1938,6 +2028,31 @@ class DashboardRenderingTest(unittest.TestCase):
 
         self.assertNotIn("/youtube/status", js)
 
+    def test_youtube_oauth_values_come_from_env_not_database_settings(self):
+        self.addCleanup(lambda: main.db_write(
+            "DELETE FROM settings WHERE key IN (?,?,?)",
+            ("youtube_client_id", "youtube_client_secret", "youtube_redirect_uri"),
+        ))
+        main.set_setting("youtube_client_id", "db-client-id")
+        main.set_setting("youtube_client_secret", "db-client-secret")
+        main.set_setting("youtube_redirect_uri", "http://db.example/youtube/callback")
+
+        with mock.patch.dict(main.os.environ, {
+            "YOUTUBE_CLIENT_ID": "env-client-id",
+            "YOUTUBE_CLIENT_SECRET": "env-client-secret",
+            "YOUTUBE_REDIRECT_URI": "http://env.example/youtube/callback",
+        }):
+            self.assertEqual("env-client-id", main.effective_youtube_client_id())
+            self.assertEqual("env-client-secret", main.effective_youtube_client_secret())
+            self.assertEqual("http://env.example/youtube/callback", main.effective_youtube_redirect_uri())
+
+    def test_frontend_no_longer_opens_youtube_oauth_credentials_popup(self):
+        js = (main.STATIC_DIR / "app.js").read_text()
+
+        self.assertNotIn("saveOAuthSettings", js)
+        self.assertNotIn("oauth-modal", js)
+        self.assertNotIn("youtube_client_id", js)
+
     def test_generated_short_renders_play_button_and_video_modal(self):
         request = Request({
             "type": "http",
@@ -2358,6 +2473,113 @@ class DashboardRenderingTest(unittest.TestCase):
         self.assertNotIn("saveCaptionRows", html)
         self.assertNotIn("V2 Engine Log", html)
 
+    def test_review_page_renders_multi_platform_upload_actions(self):
+        request = Request({
+            "type": "http",
+            "method": "GET",
+            "path": "/short/45/review",
+            "headers": [],
+        })
+        response = main.templates.TemplateResponse(
+            request,
+            "review.html",
+            context={
+                "short": {
+                    "id": 45,
+                    "video_id": 2,
+                    "filename": "ready_short.mp4",
+                    "source_path": "",
+                    "title": "Ready Short",
+                    "description": "",
+                    "start_time": 0,
+                    "end_time": 21,
+                    "duration": 21,
+                    "status": "approved",
+                    "source_title": "Source video",
+                    "youtube_video_id": "source123",
+                    "latest_upload": None,
+                    "series_badge_enabled": 1,
+                    "series_badge_label": "Funniest Moment",
+                    "series_badge_text": "Source video - Part 2/8",
+                    "series_part_number": 2,
+                    "series_total_parts": 8,
+                },
+                "youtube_connected": True,
+                "snapchat_configured": True,
+            },
+        )
+        html = response.body.decode()
+
+        self.assertIn("Upload to YouTube", html)
+        self.assertIn("Prepare for TikTok", html)
+        self.assertIn("Share to Snapchat", html)
+        self.assertIn("uploadShort(45, 'youtube'", html)
+        self.assertIn("prepareTikTok(45", html)
+        self.assertIn("shareToSnapchat(45", html)
+        self.assertIn("Top Badge", html)
+        self.assertIn("review-series-badge-enabled", html)
+        self.assertIn("Source video - Part 2/8", html)
+
+    def test_queue_page_renders_platform_filters_and_badges(self):
+        request = Request({
+            "type": "http",
+            "method": "GET",
+            "path": "/queue",
+            "headers": [],
+        })
+        response = main.templates.TemplateResponse(
+            request,
+            "queue.html",
+            context={
+                "queue": [{
+                    "short_id": 10,
+                    "title": "Queue Short",
+                    "upload_title": "Queue Short",
+                    "short_status": "approved",
+                    "filename": "queue.mp4",
+                    "duration": 20,
+                    "source_title": "Source video",
+                    "upload_id": 99,
+                    "platform": "tiktok",
+                    "upload_status": "ready",
+                    "platform_status": "READY",
+                    "platform_url": "",
+                    "error_message": "",
+                }],
+                "status_filter": "tiktok",
+                "youtube_connected": True,
+                "has_youtube_oauth": True,
+                "snapchat_configured": True,
+            },
+        )
+        html = response.body.decode()
+
+        self.assertIn("youtube", html)
+        self.assertIn("tiktok", html)
+        self.assertIn("snapchat", html)
+        self.assertIn("Platform tiktok", html)
+        self.assertIn("ready", html)
+
+    def test_frontend_uses_generic_platform_upload_and_snapchat_share(self):
+        js = (main.STATIC_DIR / "app.js").read_text()
+
+        self.assertIn("/short/${shortId}/prepare-tiktok", js)
+        self.assertIn("prepareTikTok", js)
+        self.assertIn("showPublishKitDrawer", js)
+        self.assertIn("copyPublishKitField", js)
+        self.assertIn("publish-kit-title", js)
+        self.assertIn("publish-kit-caption", js)
+        self.assertIn("publish-kit-hashtags", js)
+        self.assertIn("publish-kit-copy-all", js)
+        self.assertIn("iconButton", js)
+        self.assertIn("review-series-badge-text", js)
+        self.assertIn("series_badge_enabled", js)
+        self.assertNotIn("tiktok-ready-title", js)
+        self.assertNotIn("<textarea id=\"tiktok-ready", js)
+        self.assertIn("shareToSnapchat", js)
+        self.assertIn("/share-snapchat", js)
+        self.assertNotIn("connectTikTok", js)
+
 
 class VideoSourceClassificationTest(unittest.TestCase):
     def test_parse_youtube_duration(self):
@@ -2569,6 +2791,26 @@ class StudioWorkflowTest(unittest.TestCase):
         self.assertTrue(srt_path.endswith(".srt"))
         self.assertIn("Edited caption for export", (main.OUTPUTS_DIR / "studio_workflow_short_01.srt").read_text())
 
+    def test_regenerate_short_passes_saved_series_badge_to_export(self):
+        short = main.update_short_metadata(self.short_id, {
+            "series_badge_enabled": True,
+            "series_badge_label": "Funniest Moment",
+            "series_badge_text": "Studio workflow - Part 1/3",
+            "series_title": "Studio workflow",
+            "series_part_number": 1,
+            "series_total_parts": 3,
+        })
+
+        self.assertEqual("Studio workflow - Part 1/3", short["series_badge_text"])
+
+        with mock.patch.object(main, "export_short_clip", return_value=True) as export_short_clip:
+            main.regenerate_short(self.short_id)
+
+        preset = export_short_clip.call_args.kwargs["preset"]
+        self.assertTrue(preset["series_badge_enabled"])
+        self.assertEqual("Funniest Moment", preset["series_badge_label"])
+        self.assertEqual("Studio workflow - Part 1/3", preset["series_badge_text"])
+
     def test_update_short_captions_validates_and_saves_structured_rows(self):
         cues = [
             {"start": 0.2, "end": 1.0, "text": "kaise ho", "confidence": 0.92},
@@ -2631,6 +2873,117 @@ class StudioWorkflowTest(unittest.TestCase):
         self.assertEqual("yt123", upload_row["platform_video_id"])
         self.assertEqual("https://youtube.com/shorts/yt123", upload_row["platform_url"])
 
+    def test_prepare_tiktok_records_ready_package_without_uploading(self):
+        main.update_short_status(self.short_id, "approved")
+        main.update_short_metadata(self.short_id, {
+            "upload_title": "Stage joke",
+            "upload_description": "A funny crowd moment #comedy",
+        })
+
+        package = main.create_tiktok_ready_package(self.short_id)
+        upload_row = package["upload"]
+        metadata = main.parse_json_object(upload_row["metadata_json"])
+
+        self.assertEqual("tiktok", upload_row["platform"])
+        self.assertEqual("ready", upload_row["status"])
+        self.assertEqual("READY", upload_row["platform_status"])
+        self.assertEqual("https://www.tiktok.com/upload", package["upload_url"])
+        self.assertEqual("Stage joke", package["title"])
+        self.assertEqual("A funny crowd moment", package["description"])
+        self.assertIn("Stage joke", package["caption"])
+        self.assertEqual("#comedy", package["hashtags"][0])
+        self.assertIn("#stage", package["hashtags"])
+        self.assertIn("#crowd", package["hashtags"])
+        self.assertIn("#comedy", package["hashtags_text"])
+        self.assertIn("Stage joke", package["copy_all_text"])
+        self.assertIn("A funny crowd moment", package["copy_all_text"])
+        self.assertIn("#comedy", package["copy_all_text"])
+        self.assertIn("/download/studio_workflow_short_01.mp4", package["download_url"])
+        self.assertEqual(package["caption"], metadata["caption"])
+        self.assertEqual(package["copy_all_text"], metadata["copy_all_text"])
+        self.assertEqual("approved", main.get_short_detail(self.short_id)["status"])
+
+    def test_prepare_tiktok_generates_dynamic_hashtags_from_short_text(self):
+        main.update_short_status(self.short_id, "approved")
+        main.update_short_metadata(self.short_id, {
+            "upload_title": "Aashi roast gets wild",
+            "upload_description": "Crowd reaction after the punchline",
+        })
+
+        package = main.create_tiktok_ready_package(self.short_id)
+
+        self.assertIn("#aashi", package["hashtags"])
+        self.assertIn("#roast", package["hashtags"])
+        self.assertIn("#crowd", package["hashtags"])
+        self.assertIn("#reaction", package["hashtags"])
+        self.assertNotIn("#fyp", package["hashtags"])
+        self.assertNotIn("#shorts", package["hashtags"])
+        self.assertNotIn("#funny", package["hashtags"])
+        self.assertIn("Aashi roast gets wild", package["copy_all_text"])
+        self.assertIn("#aashi", package["copy_all_text"])
+
+    def test_publish_kit_description_rejects_caption_like_text(self):
+        main.update_short_status(self.short_id, "approved")
+        caption_like = "haan matlab main yeh bol raha hoon audience hans rahi thi phir woh bolta hai"
+        main.update_short_metadata(self.short_id, {
+            "upload_title": "Aashi roast gets wild",
+            "upload_description": caption_like,
+            "caption_text": caption_like,
+        })
+
+        package = main.create_tiktok_ready_package(self.short_id)
+
+        self.assertNotEqual(caption_like, package["description"])
+        self.assertNotIn("haan matlab", package["description"].lower())
+        self.assertIn("Aashi roast gets wild", package["description"])
+        self.assertIn("description_was_caption_like", package["quality_notes"])
+
+    def test_publish_kit_description_rejects_hindi_transcript_text(self):
+        main.update_short_status(self.short_id, "approved")
+        transcript_description = (
+            "आपने देखा है जरा भी latent देखा है आपने? Alright and of course "
+            "सोलंकी भाई thank you so much for coming again. समय honestly I want to say something."
+        )
+        main.update_short_metadata(self.short_id, {
+            "title": "Funny Clip",
+            "upload_title": "Funny Clip",
+            "upload_description": transcript_description,
+            "caption_text": transcript_description,
+        })
+
+        package = main.create_tiktok_ready_package(self.short_id)
+
+        self.assertNotIn("आपने", package["description"])
+        self.assertNotIn("Alright and of course", package["description"])
+        self.assertNotEqual(package["description"], package["final_caption"])
+        self.assertIn("stage comedy", package["description"].lower())
+        self.assertIn("description_was_caption_like", package["quality_notes"])
+        self.assertIn("#latent", package["hashtags"])
+        self.assertNotIn("#alright", package["hashtags"])
+        self.assertNotIn("#course", package["hashtags"])
+        self.assertNotIn("#honestly", package["hashtags"])
+        self.assertNotIn("#thank", package["hashtags"])
+
+    def test_snapchat_share_records_shared_without_marking_short_uploaded(self):
+        main.update_short_status(self.short_id, "approved")
+
+        share = main.create_snapchat_share(self.short_id)
+        short = main.get_short_detail(self.short_id)
+
+        self.assertEqual("snapchat", share["upload"]["platform"])
+        self.assertEqual("shared", share["upload"]["status"])
+        self.assertIn("snapchat", share["share_url"])
+        self.assertEqual("approved", short["status"])
+
+    def test_generic_youtube_upload_route_keeps_compatibility(self):
+        main.update_short_status(self.short_id, "approved")
+        with mock.patch.object(main, "create_youtube_upload") as create_youtube_upload:
+            create_youtube_upload.return_value = {"platform": "youtube", "status": "uploaded"}
+            upload_row = main.create_platform_upload(self.short_id, "youtube")
+
+        self.assertEqual("uploaded", upload_row["status"])
+        create_youtube_upload.assert_called_once()
+
     def test_upload_failure_is_retryable(self):
         main.update_short_status(self.short_id, "approved")
         with mock.patch.object(main.youtube_upload, "upload_short_to_youtube", side_effect=RuntimeError("token missing")):
@@ -2664,6 +3017,19 @@ class StudioWorkflowTest(unittest.TestCase):
         self.assertGreaterEqual(refreshed, 1)
         stored = main.db_read("SELECT * FROM short_analytics WHERE upload_id=?", (upload_id,))
         self.assertEqual(100, stored[-1]["views"])
+
+    def test_queue_filters_platform_uploads(self):
+        main.update_short_status(self.short_id, "approved")
+        main.db_write(
+            "INSERT INTO short_uploads (short_id, platform, status, platform_video_id) VALUES (?,?,?,?)",
+            (self.short_id, "tiktok", "failed", "pub123"),
+        )
+
+        tiktok_queue = main.get_upload_queue("tiktok")
+        youtube_queue = main.get_upload_queue("youtube")
+
+        self.assertTrue(any(row["short_id"] == self.short_id for row in tiktok_queue))
+        self.assertFalse(any(row["short_id"] == self.short_id for row in youtube_queue))
 
 
 if __name__ == "__main__":

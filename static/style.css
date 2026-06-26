@@ -648,6 +648,89 @@ body.modal-open { overflow: hidden; }
   outline: none;
 }
 
+.publish-kit-dialog {
+  width: min(560px, 100%);
+}
+
+.publish-kit-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.publish-kit-status span {
+  border: 1px solid #22c55e40;
+  color: var(--green);
+  background: #22c55e10;
+  border-radius: 999px;
+  padding: 0.18rem 0.5rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+}
+
+.publish-kit-field {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #02061766;
+  padding: 0.7rem;
+}
+
+.publish-kit-field-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.45rem;
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.publish-kit-value {
+  color: var(--text);
+  font-size: 0.86rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.publish-kit-caption {
+  max-height: 150px;
+  overflow: auto;
+}
+
+.publish-kit-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.publish-kit-tags span {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid #3b82f655;
+  color: #93c5fd;
+  background: #3b82f612;
+  border-radius: 999px;
+  padding: 0.2rem 0.5rem;
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.publish-kit-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.45rem;
+}
+
+.publish-kit-icon {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+}
+
 /* ---------- Spinner ---------- */
 .spin {
   display: inline-block;

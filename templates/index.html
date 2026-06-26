@@ -127,6 +127,12 @@
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22.54 6.42a2.78 2.78 0 0 0-1.95-1.95C18.88 4 12 4 12 4s-6.88 0-8.59.47A2.78 2.78 0 0 0 1.46 6.42 29 29 0 0 0 1 12a29 29 0 0 0 .46 5.58 2.78 2.78 0 0 0 1.95 1.95C5.12 20 12 20 12 20s6.88 0 8.59-.47a2.78 2.78 0 0 0 1.95-1.95A29 29 0 0 0 23 12a29 29 0 0 0-.46-5.58z"/><polygon points="9.75 15.02 15.5 12 9.75 8.98 9.75 15.02"/></svg>
           {% if youtube_connected %}Connected{% else %}Connect YouTube{% endif %}
         </button>
+        <span class="pill ok">
+          <span class="dot"></span>TikTok Ready Flow
+        </span>
+        <span class="pill {% if snapchat_configured %}ok{% else %}warn{% endif %}">
+          <span class="dot"></span>{% if snapchat_configured %}Snapchat Configured{% else %}Snapchat Share Setup{% endif %}
+        </span>
       </div>
 
       <div class="settings-subsection">
@@ -149,6 +155,14 @@
           <label class="settings-field">
             <span class="field-label">Caption Margin</span>
             <input id="preset-margin-v" class="field-input" type="number" min="0" max="240" value="{{ output_config.caption_margin_v | default(40) }}" />
+          </label>
+          <label class="settings-field checkbox-field">
+            <span class="field-label">Top Part Badge</span>
+            <input id="preset-series-badge-enabled" type="checkbox" {% if output_config.series_badge_enabled is not defined or output_config.series_badge_enabled %}checked{% endif %} />
+          </label>
+          <label class="settings-field">
+            <span class="field-label">Badge Label</span>
+            <input id="preset-series-badge-label" class="field-input" type="text" maxlength="32" value="{{ output_config.series_badge_label | default('Funniest Moment') }}" />
           </label>
           <label class="settings-field">
             <span class="field-label">Resolution</span>
@@ -402,6 +416,11 @@
               {% if short.latest_upload and short.latest_upload.status %}
               <span class="short-status short-status-{{ short.latest_upload.status }}">{{ short.latest_upload.status }}</span>
               {% endif %}
+              {% if short.platform_uploads is defined and short.platform_uploads %}
+                {% for upload in short.platform_uploads %}
+                <span class="short-status short-status-{{ upload.status }}">{{ upload.platform|capitalize }} {{ upload.status }}</span>
+                {% endfor %}
+              {% endif %}
             </div>
             {% if short.title %}
             <div class="short-title">{{ short.title }}</div>
@@ -451,7 +470,9 @@
               <button class="btn btn-secondary btn-sm" onclick="updateShortStatus({{ short.id }}, 'approved', this)">Approve</button>
               <button class="btn btn-danger btn-sm" onclick="updateShortStatus({{ short.id }}, 'rejected', this)">Reject</button>
               {% if (short.status or 'draft') == 'approved' %}
-              <button class="btn btn-ghost btn-sm" onclick="uploadShort({{ short.id }}, this)">Upload</button>
+              <button class="btn btn-ghost btn-sm" onclick="uploadShort({{ short.id }}, 'youtube', this)">Upload to YouTube</button>
+              <button class="btn btn-ghost btn-sm" onclick="prepareTikTok({{ short.id }}, this)">Prepare for TikTok</button>
+              <button class="btn btn-ghost btn-sm" onclick="shareToSnapchat({{ short.id }}, this)">Share to Snapchat</button>
               {% endif %}
               <a href="/download/{{ short.filename }}" class="btn btn-ghost btn-sm" style="text-decoration:none" download>
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
@@ -481,35 +502,6 @@
       <button class="btn btn-secondary btn-sm" onclick="closeShortPlayer()" aria-label="Close preview">Close</button>
     </div>
     <video id="short-player-video" class="short-player-video" controls playsinline preload="metadata"></video>
-  </div>
-</div>
-
-<div class="short-player-modal" id="oauth-modal" aria-hidden="true" role="dialog" aria-modal="true">
-  <div class="short-player-backdrop" onclick="closeOAuthModal()"></div>
-  <div class="short-player-dialog" style="max-width:440px">
-    <div class="short-player-header">
-      <div>
-        <div class="short-player-title">YouTube OAuth Credentials</div>
-        <div class="short-player-filename">Enter your Google Cloud OAuth credentials to connect YouTube.</div>
-      </div>
-      <button class="btn btn-secondary btn-sm" onclick="closeOAuthModal()" aria-label="Close">Close</button>
-    </div>
-    <div style="padding:1rem 1.25rem;display:flex;flex-direction:column;gap:0.75rem">
-      <label class="settings-field">
-        <span class="field-label">Client ID</span>
-        <input id="oauth-client-id" class="field-input" type="text" placeholder="xxxxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com" />
-      </label>
-      <label class="settings-field">
-        <span class="field-label">Client Secret</span>
-        <input id="oauth-client-secret" class="field-input" type="text" placeholder="GOCSPX-xxxxxxxxxxxxxxxxxxxx" />
-      </label>
-      <label class="settings-field">
-        <span class="field-label">Redirect URI</span>
-        <input id="oauth-redirect-uri" class="field-input" type="text" placeholder="http://localhost:8000/youtube/callback" />
-      </label>
-      <div class="field-hint">Create a project at <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener">Google Cloud Console</a>, enable the YouTube Data API v3, and add an OAuth 2.0 Client ID credential with the Redirect URI above.</div>
-      <button class="btn btn-primary" onclick="saveOAuthSettings()" style="align-self:flex-end">Save &amp; Connect</button>
-    </div>
   </div>
 </div>
 

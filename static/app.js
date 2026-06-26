@@ -106,6 +106,11 @@ async function saveDefaultPreset(btn) {
       document.getElementById("preset-margin-v")?.value || "40",
       10,
     ),
+    series_badge_enabled:
+      document.getElementById("preset-series-badge-enabled")?.checked !== false,
+    series_badge_label:
+      document.getElementById("preset-series-badge-label")?.value ||
+      "Funniest Moment",
     width: Number.isFinite(width) ? width : 1080,
     height: Number.isFinite(height) ? height : 1920,
     encoder_preset:
@@ -155,7 +160,7 @@ async function disconnectYouTube() {
   }
 }
 
-function startConnectionStatusPolling() {
+function startConnectionStatusPolling(platformName = "YouTube") {
   if (_connectionCheckInterval) {
     clearInterval(_connectionCheckInterval);
   }
@@ -165,7 +170,7 @@ function startConnectionStatusPolling() {
       _oauthWindow = null;
       clearInterval(_connectionCheckInterval);
       _connectionCheckInterval = null;
-      showToast("YouTube authorization window closed. Refreshing...", "info");
+      showToast(`${platformName} authorization window closed. Refreshing...`, "info");
       setTimeout(() => location.reload(), 800);
     }
   }, 1000);
@@ -198,23 +203,10 @@ async function connectYouTube() {
     }
 
     if (data.missing && data.missing.length > 0) {
-      // OAuth credentials not configured, open modal
-      const modal = document.getElementById("oauth-modal");
-      if (modal) {
-        modal.classList.add("open");
-        document.body.classList.add("modal-open");
-
-        // Pre-fill redirect URI with default if empty
-        const redirectUriEl = document.getElementById("oauth-redirect-uri");
-        if (redirectUriEl && !redirectUriEl.value) {
-          redirectUriEl.value = window.location.origin + "/youtube/callback";
-        }
-      } else {
-        showToast(
-          "OAuth configuration required. Please configure Client ID and Redirect URI.",
-          "error",
-        );
-      }
+      showToast(
+        "YouTube OAuth config is missing in .env: " + data.missing.join(", "),
+        "error",
+      );
       return;
     }
 
@@ -256,65 +248,6 @@ async function connectYouTube() {
       btn.disabled = false;
     }
     // Don't reset button text here - it will be updated by status check
-  }
-}
-
-function closeOAuthModal() {
-  const modal = document.getElementById("oauth-modal");
-  if (!modal) return;
-  modal.classList.remove("open");
-  document.body.classList.remove("modal-open");
-}
-
-async function saveOAuthSettings() {
-  const clientIdEl = document.getElementById("oauth-client-id");
-  const clientSecretEl = document.getElementById("oauth-client-secret");
-  const redirectUriEl = document.getElementById("oauth-redirect-uri");
-  if (!clientIdEl || !redirectUriEl) {
-    showToast(
-      "OAuth form elements not found. Try refreshing the page.",
-      "error",
-    );
-    return;
-  }
-  const clientId = clientIdEl.value.trim();
-  const clientSecret = clientSecretEl ? clientSecretEl.value.trim() : "";
-  const redirectUri = redirectUriEl.value.trim();
-
-  if (!clientId || !redirectUri) {
-    showToast("Client ID and Redirect URI are required.", "error");
-    return;
-  }
-
-  try {
-    const res = await fetch("/settings", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        youtube_client_id: clientId,
-        youtube_client_secret: clientSecret,
-        youtube_redirect_uri: redirectUri,
-      }),
-    });
-    let data;
-    try {
-      data = await res.json();
-    } catch (_) {
-      data = {};
-    }
-    if (!res.ok) {
-      showToast(
-        data.detail || "Failed to save OAuth settings (" + res.status + ")",
-        "error",
-      );
-      return;
-    }
-    closeOAuthModal();
-    showToast("OAuth credentials saved! Connecting…", "success");
-    connectYouTube();
-  } catch (e) {
-    showToast("Network error saving OAuth settings: " + e.message, "error");
-    console.error("saveOAuthSettings error:", e);
   }
 }
 
@@ -742,6 +675,13 @@ function collectReviewMetadata() {
     upload_title: title,
     description,
     upload_description: description,
+    series_badge_enabled:
+      document.getElementById("review-series-badge-enabled")?.checked !== false,
+    series_badge_label:
+      document.getElementById("review-series-badge-label")?.value ||
+      "Funniest Moment",
+    series_badge_text:
+      document.getElementById("review-series-badge-text")?.value || "",
   };
 }
 
@@ -828,13 +768,13 @@ async function regenerateShort(shortId, btn) {
   }
 }
 
-async function uploadShort(shortId, btn) {
+async function uploadShortYoutubeLegacy(shortId, btn) {
   const done = setButtonBusy(btn, "Uploading…");
   try {
-    const data = await fetchJson(`/short/${shortId}/upload-youtube`, {
+    const data = await fetchJson(`/short/${shortId}/upload`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ privacy_status: "private" }),
+      body: JSON.stringify({ platform: "youtube", privacy_status: "private" }),
     });
     if (data.upload?.status === "uploaded") {
       showToast("Short uploaded to YouTube as private.", "success");
@@ -847,6 +787,246 @@ async function uploadShort(shortId, btn) {
     reloadSoon(900);
   } catch (e) {
     showToast(e.message || "Could not upload Short", "error");
+    done();
+  }
+}
+
+async function uploadShort(shortId, platformOrBtn = "youtube", maybeBtn = null) {
+  const platform = typeof platformOrBtn === "string" ? platformOrBtn : "youtube";
+  const btn = typeof platformOrBtn === "string" ? maybeBtn : platformOrBtn;
+  if (platform === "tiktok") {
+    return prepareTikTok(shortId, btn);
+  }
+  const label = "Uploading...";
+  const done = setButtonBusy(btn, label);
+  try {
+    const data = await fetchJson(`/short/${shortId}/upload`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        platform,
+        privacy_status: "private",
+      }),
+    });
+    if (data.upload?.status === "uploaded") {
+      showToast("Short uploaded to YouTube.", "success");
+    } else {
+      showToast(data.upload?.error_message || `${platform} upload failed.`, "error");
+    }
+    reloadSoon(900);
+  } catch (e) {
+    showToast(e.message || "Could not upload Short", "error");
+    done();
+  }
+}
+
+async function uploadShortToAll(shortId, btn) {
+  const done = setButtonBusy(btn, "Uploading...");
+  try {
+    await fetchJson(`/short/${shortId}/upload-all`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ platforms: ["youtube"] }),
+    });
+    showToast("YouTube upload started.", "success");
+    reloadSoon(900);
+  } catch (e) {
+    showToast(e.message || "Could not upload Short", "error");
+    done();
+  }
+}
+
+async function copyTextToClipboard(text) {
+  if (!text) return false;
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return true;
+  }
+  const area = document.createElement("textarea");
+  area.value = text;
+  area.setAttribute("readonly", "readonly");
+  area.style.position = "fixed";
+  area.style.left = "-9999px";
+  document.body.appendChild(area);
+  area.select();
+  const copied = document.execCommand("copy");
+  area.remove();
+  return copied;
+}
+
+function startDownload(url) {
+  if (!url) return;
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+
+let _latestPublishKit = null;
+
+function iconSvg(name) {
+  const icons = {
+    copy: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+    download: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>',
+    external: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>',
+    close: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>',
+  };
+  return icons[name] || icons.copy;
+}
+
+function iconButton(field, label, icon = "copy") {
+  return `<button class="btn btn-ghost btn-icon publish-kit-icon" onclick="copyPublishKitField('${field}', this)" title="${label}" aria-label="${label}">${iconSvg(icon)}</button>`;
+}
+
+function ensurePublishKitDrawer() {
+  let modal = document.getElementById("publish-kit-drawer");
+  if (modal) return modal;
+  modal = document.createElement("div");
+  modal.id = "publish-kit-drawer";
+  modal.className = "short-player-modal publish-kit-modal";
+  modal.setAttribute("aria-hidden", "true");
+  modal.innerHTML = `
+    <div class="short-player-backdrop" onclick="closePublishKitDrawer()"></div>
+    <div class="short-player-dialog publish-kit-dialog">
+      <div class="short-player-header">
+        <div>
+          <div class="short-player-title">TikTok Publish Kit</div>
+          <div class="short-player-filename" id="publish-kit-filename"></div>
+        </div>
+        <button class="btn btn-secondary btn-icon" onclick="closePublishKitDrawer()" title="Close" aria-label="Close">${iconSvg("close")}</button>
+      </div>
+      <div class="publish-kit-status">
+        <span>Video ready</span>
+        <span>Text generated</span>
+        <span>Upload page opened</span>
+      </div>
+      <div class="publish-kit-field">
+        <div class="publish-kit-field-head"><span>Title</span>${iconButton("title", "Copy title")}</div>
+        <div id="publish-kit-title" class="publish-kit-value"></div>
+      </div>
+      <div class="publish-kit-field">
+        <div class="publish-kit-field-head"><span>Description</span>${iconButton("description", "Copy description")}</div>
+        <div id="publish-kit-description" class="publish-kit-value"></div>
+      </div>
+      <div class="publish-kit-field">
+        <div class="publish-kit-field-head"><span>Hashtags</span>${iconButton("hashtags_text", "Copy hashtags")}</div>
+        <div id="publish-kit-hashtags" class="publish-kit-tags"></div>
+      </div>
+      <div class="publish-kit-field">
+        <div class="publish-kit-field-head"><span>Final Caption</span>${iconButton("copy_all_text", "Copy final caption")}</div>
+        <div id="publish-kit-caption" class="publish-kit-value publish-kit-caption"></div>
+      </div>
+      <div class="publish-kit-actions">
+        <button id="publish-kit-copy-all" class="btn btn-primary btn-icon" onclick="copyPublishKitField('copy_all_text', this)" title="Copy final caption" aria-label="Copy final caption">${iconSvg("copy")}</button>
+        <a id="publish-kit-download" class="btn btn-secondary btn-icon" href="#" download title="Download video" aria-label="Download video">${iconSvg("download")}</a>
+        <a id="publish-kit-open" class="btn btn-ghost btn-icon" href="https://www.tiktok.com/upload" target="_blank" rel="noopener" title="Open TikTok" aria-label="Open TikTok">${iconSvg("external")}</a>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+  return modal;
+}
+
+function setPublishKitText(id, value) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = value || "";
+}
+
+function showPublishKitDrawer(data) {
+  _latestPublishKit = data || {};
+  const modal = ensurePublishKitDrawer();
+  setPublishKitText("publish-kit-filename", data.filename || "");
+  setPublishKitText("publish-kit-title", data.title);
+  setPublishKitText("publish-kit-description", data.description);
+  setPublishKitText("publish-kit-caption", data.copy_all_text || data.caption);
+  const tags = document.getElementById("publish-kit-hashtags");
+  if (tags) {
+    const hashtags = Array.isArray(data.hashtags) ? data.hashtags : [];
+    tags.innerHTML = hashtags.map((tag) => `<span>${escHtml(tag)}</span>`).join("");
+  }
+  const download = document.getElementById("publish-kit-download");
+  if (download) download.href = data.download_url || "#";
+  const open = document.getElementById("publish-kit-open");
+  if (open) open.href = data.upload_url || "https://www.tiktok.com/upload";
+  modal.classList.add("open");
+  modal.setAttribute("aria-hidden", "false");
+  document.body.classList.add("modal-open");
+}
+
+function closePublishKitDrawer() {
+  const modal = document.getElementById("publish-kit-drawer");
+  if (!modal) return;
+  modal.classList.remove("open");
+  modal.setAttribute("aria-hidden", "true");
+  document.body.classList.remove("modal-open");
+}
+
+async function copyPublishKitField(field, btn) {
+  const value = (_latestPublishKit || {})[field] || "";
+  if (!value) {
+    showToast("Nothing to copy.", "error");
+    return;
+  }
+  const done = setButtonBusy(btn, "Copying...");
+  try {
+    await copyTextToClipboard(value);
+    showToast("Copied.", "success");
+  } catch (e) {
+    showToast("Could not copy text.", "error");
+  } finally {
+    done();
+  }
+}
+
+async function prepareTikTok(shortId, btn) {
+  const done = setButtonBusy(btn, "Preparing...");
+  try {
+    const data = await fetchJson(`/short/${shortId}/prepare-tiktok`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+    let copied = false;
+    try {
+      copied = await copyTextToClipboard(data.copy_all_text || data.caption || "");
+    } catch (e) {
+      copied = false;
+    }
+    showPublishKitDrawer(data);
+    startDownload(data.download_url);
+    if (data.upload_url) {
+      window.open(data.upload_url, "tiktok_ready", "width=920,height=760,scrollbars=yes,resizable=yes");
+    }
+    showToast(
+      copied
+        ? "TikTok kit ready: video download started, publish text copied, upload page opened."
+        : "TikTok kit ready: video download started and upload page opened. Copy buttons are ready here.",
+      copied ? "success" : "info",
+      6500,
+    );
+    done();
+  } catch (e) {
+    showToast(e.message || "Could not prepare TikTok package", "error");
+    done();
+  }
+}
+
+async function shareToSnapchat(shortId, btn) {
+  const done = setButtonBusy(btn, "Opening...");
+  try {
+    const data = await fetchJson(`/short/${shortId}/share-snapchat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+    if (data.share_url) {
+      window.open(data.share_url, "snapchat_share", "width=520,height=760,scrollbars=yes,resizable=yes");
+      showToast("Snapchat share opened. Finish posting inside Snapchat.", "success");
+    } else {
+      showToast("Snapchat share URL was not returned.", "error");
+    }
+    reloadSoon(900);
+  } catch (e) {
+    showToast(e.message || "Could not share to Snapchat", "error");
     done();
   }
 }
@@ -898,6 +1078,17 @@ function renderShortCard(short) {
   const uploadStatus = latestUpload.status
     ? `<span class="short-status short-status-${escHtml(latestUpload.status)}">${escHtml(latestUpload.status)}</span>`
     : "";
+  const platformUploads = Array.isArray(short.platform_uploads)
+    ? short.platform_uploads
+        .map((upload) => {
+          const platform = escHtml(upload.platform || "");
+          const uploadState = escHtml(upload.status || "");
+          return platform && uploadState
+            ? `<span class="short-status short-status-${uploadState}">${platform} ${uploadState}</span>`
+            : "";
+        })
+        .join("")
+    : "";
   const duration = short.duration
     ? `${Number(short.duration).toFixed(1)}s`
     : "";
@@ -938,13 +1129,16 @@ function renderShortCard(short) {
 
   const uploadButton =
     short.status === "approved"
-      ? `<button class="btn btn-ghost btn-sm" onclick="uploadShort(${short.id}, this)">Upload</button>`
+      ? `<button class="btn btn-ghost btn-sm" onclick="uploadShort(${short.id}, 'youtube', this)">Upload to YouTube</button>
+         <button class="btn btn-ghost btn-sm" onclick="prepareTikTok(${short.id}, this)">Prepare for TikTok</button>
+         <button class="btn btn-ghost btn-sm" onclick="shareToSnapchat(${short.id}, this)">Share to Snapchat</button>`
       : "";
 
   return `<div class="short-card short-card-${status}" data-short-id="${short.id}">
     <div class="short-card-top">
       ${shortStatus}
       ${uploadStatus}
+      ${platformUploads}
     </div>
     ${title}
     <div class="short-name">${filename}</div>
@@ -1032,7 +1226,10 @@ function closeShortPlayer() {
 }
 
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") closeShortPlayer();
+  if (event.key === "Escape") {
+    closeShortPlayer();
+    closePublishKitDrawer();
+  }
 });
 
 // ---------------------------------------------------------------------------

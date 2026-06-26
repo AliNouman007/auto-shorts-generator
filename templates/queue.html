@@ -42,12 +42,14 @@
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22.54 6.42a2.78 2.78 0 0 0-1.95-1.95C18.88 4 12 4 12 4s-6.88 0-8.59.47A2.78 2.78 0 0 0 1.46 6.42 29 29 0 0 0 1 12a29 29 0 0 0 .46 5.58 2.78 2.78 0 0 0 1.95 1.95C5.12 20 12 20 12 20s6.88 0 8.59-.47a2.78 2.78 0 0 0 1.95-1.95A29 29 0 0 0 23 12a29 29 0 0 0-.46-5.58z"/><polygon points="9.75 15.02 15.5 12 9.75 8.98 9.75 15.02"/></svg>
         {% if youtube_connected %}Connected{% else %}Connect YouTube{% endif %}
       </button>
+      <span class="pill ok"><span class="dot"></span>TikTok Ready Flow</span>
+      <span class="pill {% if snapchat_configured %}ok{% else %}warn{% endif %}"><span class="dot"></span>Snapchat Share</span>
       <button class="btn btn-ghost" onclick="refreshAnalytics(this)">Refresh Analytics</button>
     </div>
   </div>
 
   <div class="queue-filters">
-    {% for item in ['all', 'approved', 'scheduled', 'uploaded', 'failed'] %}
+    {% for item in ['all', 'youtube', 'tiktok', 'snapchat', 'approved', 'scheduled', 'ready', 'uploaded', 'failed'] %}
     <a class="filter-chip {{ 'active' if status_filter == item else '' }}" href="/queue?status={{ item }}">{{ item }}</a>
     {% endfor %}
   </div>
@@ -66,14 +68,18 @@
         {% if item.short_status not in ['approved', 'rejected'] %}
         <span class="short-status short-status-{{ item.short_status }}">{{ item.short_status }}</span>
         {% endif %}
+        {% if item.platform %}<span class="score-pill">Platform {{ item.platform }}</span>{% endif %}
         {% if item.upload_status %}<span class="short-status short-status-{{ item.upload_status }}">{{ item.upload_status }}</span>{% endif %}
+        {% if item.platform_status %}<span class="score-pill">{{ item.platform_status }}</span>{% endif %}
       </div>
       <div class="queue-row-actions">
         <a class="btn btn-secondary btn-sm" href="/short/{{ item.short_id }}/review">Edit</a>
-        {% if item.upload_status == 'failed' and item.upload_id %}
+        {% if item.upload_status == 'failed' and item.upload_id and item.platform == 'youtube' %}
         <button class="btn btn-ghost btn-sm" onclick="retryUpload({{ item.upload_id }}, this)">Retry</button>
         {% elif item.short_status == 'approved' %}
-        <button class="btn btn-primary btn-sm" onclick="uploadShort({{ item.short_id }}, this)">Upload</button>
+        <button class="btn btn-primary btn-sm" onclick="uploadShort({{ item.short_id }}, 'youtube', this)">Upload to YouTube</button>
+        <button class="btn btn-secondary btn-sm" onclick="prepareTikTok({{ item.short_id }}, this)">Prepare for TikTok</button>
+        <button class="btn btn-ghost btn-sm" onclick="shareToSnapchat({{ item.short_id }}, this)">Share to Snapchat</button>
         {% endif %}
         {% if item.platform_url %}
         <a class="btn btn-ghost btn-sm" href="{{ item.platform_url }}" target="_blank" rel="noopener">Open</a>
@@ -95,35 +101,6 @@
     {% endfor %}
   </div>
 </main>
-
-<div class="short-player-modal" id="oauth-modal" aria-hidden="true" role="dialog" aria-modal="true">
-  <div class="short-player-backdrop" onclick="closeOAuthModal()"></div>
-  <div class="short-player-dialog" style="max-width:440px">
-    <div class="short-player-header">
-      <div>
-        <div class="short-player-title">YouTube OAuth Credentials</div>
-        <div class="short-player-filename">Enter your Google Cloud OAuth credentials to connect YouTube.</div>
-      </div>
-      <button class="btn btn-secondary btn-sm" onclick="closeOAuthModal()" aria-label="Close">Close</button>
-    </div>
-    <div style="padding:1rem 1.25rem;display:flex;flex-direction:column;gap:0.75rem">
-      <label class="settings-field">
-        <span class="field-label">Client ID</span>
-        <input id="oauth-client-id" class="field-input" type="text" placeholder="xxxxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com" />
-      </label>
-      <label class="settings-field">
-        <span class="field-label">Client Secret</span>
-        <input id="oauth-client-secret" class="field-input" type="text" placeholder="GOCSPX-xxxxxxxxxxxxxxxxxxxx" />
-      </label>
-      <label class="settings-field">
-        <span class="field-label">Redirect URI</span>
-        <input id="oauth-redirect-uri" class="field-input" type="text" placeholder="http://localhost:8000/youtube/callback" />
-      </label>
-      <div class="field-hint">Create a project at <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener">Google Cloud Console</a>, enable the YouTube Data API v3, and add an OAuth 2.0 Client ID credential with the Redirect URI above.</div>
-      <button class="btn btn-primary" onclick="saveOAuthSettings()" style="align-self:flex-end">Save &amp; Connect</button>
-    </div>
-  </div>
-</div>
 
 <div id="toast-area"></div>
 <script src="/static/app.js?v=12"></script>

@@ -32,6 +32,9 @@ from services.captions import export as caption_export
 from services.captions import line_builder as caption_line_builder
 from services.clip_director import selection as clip_selection
 from services.clip_director.llm import request_llm_episode_profile, request_llm_selection
+from services.overlays import series_badge
+from services.publishing.kit import build_publish_kit
+from services.uploads import snapchat as snapchat_upload
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -95,6 +98,7 @@ GROQ_LLM_MODEL = env_value("GROQ_LLM_MODEL", "llama-3.1-8b-instant")
 DEEPGRAM_API_KEY = env_value("DEEPGRAM_API_KEY")
 DEEPGRAM_MODEL = env_value("DEEPGRAM_MODEL", "nova-3")
 DEEPGRAM_LANGUAGE = env_value("DEEPGRAM_LANGUAGE", "multi")
+SNAPCHAT_CLIENT_ID = env_value("SNAPCHAT_CLIENT_ID")
 WEBHOOK_SECRET = env_value("WEBHOOK_SECRET")
 PORT = env_int("PORT", 8000)
 
@@ -295,6 +299,19 @@ def init_db():
         "ALTER TABLE shorts ADD COLUMN caption_cues_json TEXT",
         "ALTER TABLE shorts ADD COLUMN caption_srt TEXT",
         "ALTER TABLE shorts ADD COLUMN caption_status TEXT",
+        "ALTER TABLE shorts ADD COLUMN series_title TEXT",
+        "ALTER TABLE shorts ADD COLUMN series_part_number INTEGER",
+        "ALTER TABLE shorts ADD COLUMN series_total_parts INTEGER",
+        "ALTER TABLE shorts ADD COLUMN series_badge_label TEXT",
+        "ALTER TABLE shorts ADD COLUMN series_badge_text TEXT",
+        "ALTER TABLE shorts ADD COLUMN series_badge_enabled INTEGER DEFAULT 1",
+        "ALTER TABLE platform_accounts ADD COLUMN platform_user_id TEXT",
+        "ALTER TABLE platform_accounts ADD COLUMN scopes TEXT",
+        "ALTER TABLE platform_accounts ADD COLUMN refresh_expires_at TEXT",
+        "ALTER TABLE platform_accounts ADD COLUMN metadata_json TEXT",
+        "ALTER TABLE short_uploads ADD COLUMN publish_id TEXT",
+        "ALTER TABLE short_uploads ADD COLUMN platform_status TEXT",
+        "ALTER TABLE short_uploads ADD COLUMN metadata_json TEXT",
     ]:
         try:
             conn.execute(col_sql)
@@ -595,20 +612,25 @@ def effective_ai_model() -> str:
 
 
 def effective_youtube_client_id() -> str:
-    return get_setting("youtube_client_id") or env_value("YOUTUBE_CLIENT_ID")
+    return env_value("YOUTUBE_CLIENT_ID")
 
 
 def effective_youtube_client_secret() -> str:
-    return get_setting("youtube_client_secret") or env_value("YOUTUBE_CLIENT_SECRET")
+    return env_value("YOUTUBE_CLIENT_SECRET")
 
 
 def effective_youtube_redirect_uri() -> str:
-    return get_setting("youtube_redirect_uri") or env_value("YOUTUBE_REDIRECT_URI")
+    return env_value("YOUTUBE_REDIRECT_URI")
+
+
+def effective_snapchat_client_id() -> str:
+    return get_setting("snapchat_client_id") or SNAPCHAT_CLIENT_ID
 
 
 SHORT_STATUSES = {"draft", "approved",
                   "rejected", "exported", "uploaded", "failed"}
-UPLOAD_STATUSES = {"draft", "scheduled", "uploading", "uploaded", "failed"}
+UPLOAD_STATUSES = {"draft", "scheduled", "uploading", "processing", "uploaded", "shared", "ready", "failed"}
+UPLOAD_PLATFORMS = {"youtube", "tiktok", "snapchat"}
 
 
 def utc_now() -> str:
@@ -718,28 +740,46 @@ def get_short_detail(short_id: int) -> dict:
 def attach_latest_uploads(shorts: list[dict]) -> list[dict]:
     for short in shorts:
         uploads = db_read(
-            "SELECT * FROM short_uploads WHERE short_id=? ORDER BY created_at DESC, id DESC LIMIT 1",
+            "SELECT * FROM short_uploads WHERE short_id=? ORDER BY created_at DESC, id DESC",
             (short["id"],),
         )
         short["latest_upload"] = uploads[0] if uploads else None
+        short["platform_uploads"] = uploads
     return shorts
 
 
 def update_short_metadata(short_id: int, data: dict) -> dict:
-    allowed = {
+    text_fields = {
         "title",
         "description",
         "caption_text",
         "upload_title",
         "upload_description",
         "scheduled_at",
+        "series_title",
+        "series_badge_label",
+        "series_badge_text",
     }
+    int_fields = {"series_part_number", "series_total_parts"}
     updates = []
     params = []
-    for key in allowed:
+    for key in text_fields:
         if key in data:
             updates.append(f"{key}=?")
             params.append(str(data.get(key) or ""))
+    for key in int_fields:
+        if key in data:
+            try:
+                value = int(data.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            updates.append(f"{key}=?")
+            params.append(value)
+    if "series_badge_enabled" in data:
+        value = data.get("series_badge_enabled")
+        enabled = value is True or str(value).lower() in {"1", "true", "yes", "on"}
+        updates.append("series_badge_enabled=?")
+        params.append(1 if enabled else 0)
     if "title" in data and "upload_title" not in data:
         updates.append("upload_title=?")
         params.append(str(data.get("title") or ""))
@@ -753,6 +793,22 @@ def update_short_metadata(short_id: int, data: dict) -> dict:
     db_write(
         f"UPDATE shorts SET {', '.join(updates)} WHERE id=?", tuple(params))
     return get_short_detail(short_id)
+
+
+def series_badge_config_for_short(short: dict, base_config: Optional[dict] = None) -> dict:
+    config = preset_config_for_export(base_config)
+    badge_text = str(short.get("series_badge_text") or "").strip()
+    if not badge_text:
+        config["series_badge_text"] = ""
+        return config
+    enabled_value = short.get("series_badge_enabled")
+    enabled = enabled_value is None or str(enabled_value).lower() not in {"0", "false", "no", "off"}
+    config.update({
+        "series_badge_enabled": enabled,
+        "series_badge_label": str(short.get("series_badge_label") or config.get("series_badge_label") or "Funniest Moment")[:32],
+        "series_badge_text": badge_text[:80],
+    })
+    return config
 
 
 def validate_caption_cues(cues: list[dict], duration: Optional[float] = None) -> list[dict]:
@@ -840,7 +896,7 @@ def regenerate_short(short_id: int, preset_config: Optional[dict] = None) -> dic
     if end <= start:
         raise ValueError("Short timing is invalid.")
     duration = end - start
-    config = preset_config_for_export(preset_config)
+    config = series_badge_config_for_short(short, preset_config)
     filename = Path(short.get("filename") or f"short_{short_id}.mp4").name
     output_path = OUTPUTS_DIR / filename
     srt_path = None
@@ -880,7 +936,8 @@ def get_upload_queue(status_filter: str = "all") -> list[dict]:
     rows = db_read(
         "SELECT shorts.id AS short_id, shorts.title, shorts.upload_title, shorts.status AS short_status, "
         "shorts.filename, shorts.duration, shorts.scheduled_at, videos.title AS source_title, "
-        "short_uploads.id AS upload_id, short_uploads.status AS upload_status, short_uploads.platform_url, "
+        "short_uploads.id AS upload_id, short_uploads.platform, short_uploads.status AS upload_status, "
+        "short_uploads.platform_status, short_uploads.publish_id, short_uploads.platform_url, "
         "short_uploads.error_message, short_uploads.platform_video_id "
         "FROM shorts "
         "JOIN videos ON videos.id=shorts.video_id "
@@ -891,6 +948,11 @@ def get_upload_queue(status_filter: str = "all") -> list[dict]:
         "ORDER BY shorts.updated_at DESC, shorts.created_at DESC"
     )
     if status_filter and status_filter != "all":
+        if status_filter in UPLOAD_PLATFORMS:
+            return [
+                row for row in rows
+                if row.get("platform") == status_filter
+            ]
         return [
             row for row in rows
             if row.get("upload_status") == status_filter or row.get("short_status") == status_filter
@@ -903,6 +965,26 @@ def get_youtube_account() -> Optional[dict]:
         "SELECT * FROM platform_accounts WHERE platform='youtube' ORDER BY updated_at DESC, id DESC LIMIT 1"
     )
     return rows[0] if rows else None
+
+
+def get_platform_account(platform: str) -> Optional[dict]:
+    if platform not in UPLOAD_PLATFORMS:
+        return None
+    rows = db_read(
+        "SELECT * FROM platform_accounts WHERE platform=? ORDER BY updated_at DESC, id DESC LIMIT 1",
+        (platform,),
+    )
+    return rows[0] if rows else None
+
+
+def _expires_at_from_seconds(seconds: object) -> str:
+    try:
+        delta = int(seconds or 0)
+    except (TypeError, ValueError):
+        delta = 0
+    if delta <= 0:
+        delta = 86400
+    return (datetime.now(timezone.utc) + timedelta(seconds=delta)).replace(microsecond=0).isoformat()
 
 
 def is_youtube_token_expired() -> bool:
@@ -928,6 +1010,10 @@ def is_youtube_connected() -> bool:
     if not account.get("access_token"):
         return False
     return not is_youtube_token_expired()
+
+
+def is_snapchat_configured() -> bool:
+    return bool(effective_snapchat_client_id())
 
 
 def get_youtube_connection_status() -> dict:
@@ -1036,12 +1122,8 @@ def handle_youtube_callback(code: str) -> dict:
 
 
 def create_youtube_upload(short_id: int, privacy_status: str = "private", scheduled_at: Optional[str] = None) -> dict:
-    short = get_short_detail(short_id)
-    if short.get("status") != "approved":
-        raise ValueError("Only approved Shorts can be uploaded.")
-    file_path = OUTPUTS_DIR / Path(short.get("filename") or "").name
-    if not file_path.exists():
-        raise ValueError("Generated Short file is missing.")
+    short, file_path = _require_approved_short_file(short_id)
+    publish_kit = build_publish_kit(short, platform="youtube")
     db_write(
         "INSERT INTO short_uploads (short_id, platform, status, privacy_status, scheduled_at, updated_at) "
         "VALUES (?,?,?,?,?,datetime('now'))",
@@ -1054,9 +1136,8 @@ def create_youtube_upload(short_id: int, privacy_status: str = "private", schedu
         result = youtube_upload.upload_short_to_youtube(
             get_youtube_account(),
             str(file_path),
-            short.get("upload_title") or short.get(
-                "title") or "Untitled Short",
-            short.get("upload_description") or short.get("description") or "",
+            publish_kit["title"],
+            publish_kit["copy_all_text"],
             privacy_status or "private",
             scheduled_at,
         )
@@ -1076,6 +1157,112 @@ def create_youtube_upload(short_id: int, privacy_status: str = "private", schedu
     return db_read("SELECT * FROM short_uploads WHERE id=?", (upload_id,))[0]
 
 
+def _require_approved_short_file(short_id: int) -> tuple[dict, Path]:
+    short = get_short_detail(short_id)
+    if short.get("status") != "approved":
+        raise ValueError("Only approved Shorts can be uploaded.")
+    file_path = OUTPUTS_DIR / Path(short.get("filename") or "").name
+    if not file_path.exists():
+        raise ValueError("Generated Short file is missing.")
+    return short, file_path
+
+
+def create_tiktok_ready_package(short_id: int, base_url: str = "") -> dict:
+    short, file_path = _require_approved_short_file(short_id)
+    if not base_url:
+        base_url = "http://localhost:8000"
+    filename = Path(short.get("filename") or "").name
+    download_url = f"/download/{filename}"
+    absolute_download_url = f"{base_url.rstrip('/')}{download_url}"
+    publish_kit = build_publish_kit(short, platform="tiktok")
+    package = {
+        "platform": "tiktok",
+        "status": "ready",
+        "platform_status": "READY",
+        "upload_url": "https://www.tiktok.com/upload",
+        "download_url": download_url,
+        "absolute_download_url": absolute_download_url,
+        "filename": filename,
+        "file_size": file_path.stat().st_size,
+        "instructions": "Download the video, copy the caption, then open TikTok Upload and paste it.",
+        **publish_kit,
+    }
+    db_write(
+        "INSERT INTO short_uploads (short_id, platform, status, platform_status, platform_url, metadata_json, updated_at) "
+        "VALUES (?,?,?,?,?,?,datetime('now'))",
+        (
+            short_id,
+            "tiktok",
+            "ready",
+            "READY",
+            package["upload_url"],
+            json.dumps(package),
+        ),
+    )
+    upload_id = db_read(
+        "SELECT id FROM short_uploads WHERE short_id=? ORDER BY id DESC LIMIT 1", (short_id,)
+    )[0]["id"]
+    package["upload"] = db_read("SELECT * FROM short_uploads WHERE id=?", (upload_id,))[0]
+    return package
+
+
+def create_snapchat_share(short_id: int, base_url: str = "") -> dict:
+    short, file_path = _require_approved_short_file(short_id)
+    if not base_url:
+        base_url = "http://localhost:8000"
+    payload = snapchat_upload.build_share_for_file(
+        base_url=base_url,
+        filename=Path(short.get("filename") or "").name,
+        caption=short.get("upload_title") or short.get("title") or "",
+        client_id=effective_snapchat_client_id(),
+        duration=float(short.get("duration") or 0),
+        file_path=str(file_path),
+    )
+    db_write(
+        "INSERT INTO short_uploads "
+        "(short_id, platform, status, platform_url, metadata_json, updated_at) "
+        "VALUES (?,?,?,?,?,datetime('now'))",
+        (
+            short_id,
+            "snapchat",
+            "shared",
+            payload["share_url"],
+            json.dumps(payload),
+        ),
+    )
+    upload_id = db_read(
+        "SELECT id FROM short_uploads WHERE short_id=? ORDER BY id DESC LIMIT 1", (short_id,)
+    )[0]["id"]
+    return {
+        "upload": db_read("SELECT * FROM short_uploads WHERE id=?", (upload_id,))[0],
+        "share_url": payload["share_url"],
+        "share": payload,
+    }
+
+
+def create_platform_upload(
+    short_id: int,
+    platform: str,
+    privacy_status: str = "private",
+    scheduled_at: Optional[str] = None,
+) -> dict:
+    platform = str(platform or "youtube").lower()
+    if platform == "youtube":
+        return create_youtube_upload(short_id, privacy_status=privacy_status, scheduled_at=scheduled_at)
+    if platform == "tiktok":
+        return create_tiktok_ready_package(short_id)["upload"]
+    raise ValueError("Unsupported upload platform.")
+
+
+def create_platform_uploads(short_id: int, platforms: list[str]) -> list[dict]:
+    uploads = []
+    for platform in platforms:
+        normalized = str(platform or "").lower()
+        if normalized in {"youtube", "tiktok"}:
+            uploads.append(create_platform_upload(short_id, normalized))
+    return uploads
+
+
 def retry_upload(upload_id: int) -> dict:
     rows = db_read("SELECT * FROM short_uploads WHERE id=?", (upload_id,))
     if not rows:
@@ -1087,6 +1274,8 @@ def retry_upload(upload_id: int) -> dict:
         raise ValueError("Generated Short file is missing.")
     db_write("UPDATE short_uploads SET status='uploading', error_message=NULL, updated_at=datetime('now') WHERE id=?", (upload_id,))
     try:
+        if upload.get("platform") != "youtube":
+            raise ValueError("Retry is only supported for YouTube uploads.")
         result = youtube_upload.upload_short_to_youtube(
             get_youtube_account(),
             str(file_path),
@@ -1653,7 +1842,7 @@ def get_audio_duration(audio_path: str) -> float:
 
 def build_audio_chunk_path(audio_path: str, index: int) -> str:
     path = Path(audio_path)
-    return str(path.with_name(f"{path.stem}_chunk_{index:03d}{path.suffix}"))
+    return path.with_name(f"{path.stem}_chunk_{index:03d}{path.suffix}").as_posix()
 
 
 def split_audio_for_transcription(
@@ -2750,10 +2939,38 @@ def _process_video_sync(
         # ── Step 4: Export ────────────────────────────────────────────────────
         step(4, "running", f"0 / {len(clips)} clips done")
         generated = 0
+        export_config = preset_config_for_export()
+        def clip_timeline_key(item: tuple[int, dict]) -> tuple[float, float, int]:
+            clip_index, clip = item
+            try:
+                start_time = float(clip.get("start", 0) or 0)
+            except (TypeError, ValueError):
+                start_time = 0.0
+            try:
+                end_time = float(clip.get("end", start_time) or start_time)
+            except (TypeError, ValueError):
+                end_time = start_time
+            return (start_time, end_time, clip_index)
+
+        series_part_by_clip_index = {
+            clip_index: part_number
+            for part_number, (clip_index, _clip) in enumerate(
+                sorted(enumerate(clips), key=clip_timeline_key),
+                start=1,
+            )
+        }
         for idx, clip in enumerate(clips, start=1):
             ensure_not_cancelled(video_id)
             start, end = clip["start"], clip["end"]
             clip_dur = end - start
+            badge = series_badge.build_series_badge(
+                source_title,
+                part_number=series_part_by_clip_index.get(idx - 1, idx),
+                total_parts=len(clips),
+                label=export_config.get("series_badge_label", "Funniest Moment"),
+                enabled=export_config.get("series_badge_enabled", True),
+            )
+            clip_export_config = {**export_config, **badge}
             caption_cues = []
             caption_words = []
             srt_content = ""
@@ -2776,7 +2993,7 @@ def _process_video_sync(
                 srt_path = str(OUTPUTS_DIR / f"{safe_id}_short_{idx:02d}.srt")
                 Path(srt_path).write_text(srt_content, encoding="utf-8")
             out_filename = f"{safe_id}_short_{idx:02d}.mp4"
-            if export_short_clip(source_path, str(OUTPUTS_DIR / out_filename), start, clip_dur, srt_path, video_id=video_id):
+            if export_short_clip(source_path, str(OUTPUTS_DIR / out_filename), start, clip_dur, srt_path, video_id=video_id, preset=clip_export_config):
                 enriched_clip = shorts_director.enrich_clip_metadata({
                     **clip,
                     "title": clip.get("title") or f"Highlight {idx}",
@@ -2831,6 +3048,21 @@ def _process_video_sync(
                         json.dumps(caption_cues)[:12000],
                         srt_content,
                         (caption_transcript or {}).get("status", "")[:40],
+                    ),
+                )
+                db_write(
+                    "UPDATE shorts SET series_title=?, series_part_number=?, series_total_parts=?, "
+                    "series_badge_label=?, series_badge_text=?, series_badge_enabled=? "
+                    "WHERE video_id=? AND filename=?",
+                    (
+                        badge.get("series_title", ""),
+                        int(badge.get("series_part_number") or 0),
+                        int(badge.get("series_total_parts") or 0),
+                        badge.get("series_badge_label", ""),
+                        badge.get("series_badge_text", ""),
+                        1 if badge.get("series_badge_enabled") else 0,
+                        video_id,
+                        out_filename,
                     ),
                 )
                 generated += 1
@@ -3003,6 +3235,7 @@ async def dashboard(request: Request):
             "presets": list_presets(),
             "youtube_connected": is_youtube_connected(),
             "has_youtube_oauth": bool(effective_youtube_client_id() and effective_youtube_client_secret() and effective_youtube_redirect_uri()),
+            "snapchat_configured": is_snapchat_configured(),
         },
     )
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
@@ -3018,26 +3251,20 @@ async def api_get_settings():
         "ai_model": effective_ai_model(),
         "default_preset": get_default_preset(),
         "youtube_connected": is_youtube_connected(),
+        "snapchat_configured": is_snapchat_configured(),
     }
 
 
 @app.post("/settings")
 async def api_save_settings(request: Request):
-    """Save channel ID, AI model preference, or YouTube OAuth settings."""
+    """Save channel ID, AI model preference, or share settings."""
     body = await request.json()
     if "channel_id" in body:
         set_setting("channel_id", str(body["channel_id"]).strip())
     if "ai_model" in body and body["ai_model"] in ("openai", "gemini", "groq"):
         set_setting("ai_model", body["ai_model"])
-    if "youtube_client_id" in body:
-        set_setting("youtube_client_id", str(
-            body["youtube_client_id"]).strip())
-    if "youtube_client_secret" in body:
-        set_setting("youtube_client_secret", str(
-            body["youtube_client_secret"]).strip())
-    if "youtube_redirect_uri" in body:
-        set_setting("youtube_redirect_uri", str(
-            body["youtube_redirect_uri"]).strip())
+    if "snapchat_client_id" in body:
+        set_setting("snapchat_client_id", str(body["snapchat_client_id"]).strip())
     return {"ok": True, "channel_id": effective_channel_id(), "ai_model": effective_ai_model()}
 
 
@@ -3249,6 +3476,7 @@ async def review_short_page(short_id: int, request: Request):
             "presets": list_presets(),
             "default_preset": get_default_preset(),
             "youtube_connected": is_youtube_connected(),
+            "snapchat_configured": is_snapchat_configured(),
         },
     )
 
@@ -3306,6 +3534,7 @@ async def queue_page(request: Request, status: str = "all"):
             "status_filter": status,
             "youtube_connected": is_youtube_connected(),
             "has_youtube_oauth": bool(effective_youtube_client_id() and effective_youtube_client_secret() and effective_youtube_redirect_uri()),
+            "snapchat_configured": is_snapchat_configured(),
         },
     )
 
@@ -3373,13 +3602,57 @@ async def youtube_callback_route(code: str = ""):
         raise HTTPException(status_code=400, detail=str(exc))
 
 
+@app.post("/short/{short_id}/upload")
+async def upload_platform_route(short_id: int, request: Request):
+    body = await request.json()
+    try:
+        return {
+            "upload": create_platform_upload(
+                short_id,
+                str(body.get("platform") or "youtube"),
+                privacy_status=str(body.get("privacy_status") or "private"),
+                scheduled_at=body.get("scheduled_at") or None,
+            )
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/short/{short_id}/upload-all")
+async def upload_all_platforms_route(short_id: int, request: Request):
+    body = await request.json()
+    try:
+        return {"uploads": create_platform_uploads(short_id, body.get("platforms") or ["youtube"])}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/short/{short_id}/prepare-tiktok")
+async def prepare_tiktok_route(short_id: int, request: Request):
+    try:
+        base_url = str(request.base_url).rstrip("/")
+        return create_tiktok_ready_package(short_id, base_url=base_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/short/{short_id}/share-snapchat")
+async def share_snapchat_route(short_id: int, request: Request):
+    try:
+        base_url = str(request.base_url).rstrip("/")
+        return create_snapchat_share(short_id, base_url=base_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
 @app.post("/short/{short_id}/upload-youtube")
 async def upload_youtube_route(short_id: int, request: Request):
     body = await request.json()
     try:
         return {
-            "upload": create_youtube_upload(
+            "upload": create_platform_upload(
                 short_id,
+                "youtube",
                 privacy_status=str(body.get("privacy_status") or "private"),
                 scheduled_at=body.get("scheduled_at") or None,
             )
