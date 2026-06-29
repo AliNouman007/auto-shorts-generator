@@ -14,7 +14,6 @@ import sqlite3
 import subprocess
 import threading
 import shutil
-import textwrap
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -27,9 +26,6 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from services import exporting, presets, shorts_director, youtube_upload
-from services.captions import deepgram as deepgram_captions
-from services.captions import export as caption_export
-from services.captions import line_builder as caption_line_builder
 from services.clip_director import selection as clip_selection
 from services.clip_director.llm import request_llm_episode_profile, request_llm_selection
 from services.overlays import series_badge
@@ -95,9 +91,6 @@ GEMINI_MODEL = env_value("GEMINI_MODEL", "gemini-2.0-flash")
 GROQ_API_KEY = env_value("GROQ_API_KEY")
 GROQ_MODEL = env_value("GROQ_MODEL", "whisper-large-v3-turbo")
 GROQ_LLM_MODEL = env_value("GROQ_LLM_MODEL", "llama-3.1-8b-instant")
-DEEPGRAM_API_KEY = env_value("DEEPGRAM_API_KEY")
-DEEPGRAM_MODEL = env_value("DEEPGRAM_MODEL", "nova-3")
-DEEPGRAM_LANGUAGE = env_value("DEEPGRAM_LANGUAGE", "multi")
 SNAPCHAT_CLIENT_ID = env_value("SNAPCHAT_CLIENT_ID")
 WEBHOOK_SECRET = env_value("WEBHOOK_SECRET")
 PORT = env_int("PORT", 8000)
@@ -105,12 +98,7 @@ PORT = env_int("PORT", 8000)
 YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
 
 REQUIRED_VIDEO_TOOLS = ("ffmpeg", "ffprobe")
-CAPTION_MAX_LINE_LENGTH = 32
-CAPTION_MAX_LINES = 3
-CAPTION_MAX_SECONDS = 2.5
-CAPTION_MAX_WORDS = 6
-CAPTION_WORD_GAP_SECONDS = 0.9
-CAPTION_LANGUAGE_HINT = env_value("CAPTION_LANGUAGE_HINT", "hi").lower()
+TRANSCRIPTION_LANGUAGE_HINT = env_value("TRANSCRIPTION_LANGUAGE_HINT", "hi").lower()
 
 
 def command_available(command: str) -> bool:
@@ -206,7 +194,6 @@ def init_db():
             start_time REAL,
             end_time REAL,
             duration REAL,
-            caption_text TEXT,
             title TEXT,
             virality_score INTEGER,
             completion_score INTEGER,
@@ -281,7 +268,6 @@ def init_db():
         "ALTER TABLE shorts ADD COLUMN description TEXT",
         "ALTER TABLE shorts ADD COLUMN original_start_time REAL",
         "ALTER TABLE shorts ADD COLUMN original_end_time REAL",
-        "ALTER TABLE shorts ADD COLUMN approved_at TEXT",
         "ALTER TABLE shorts ADD COLUMN updated_at TEXT",
         "ALTER TABLE shorts ADD COLUMN upload_title TEXT",
         "ALTER TABLE shorts ADD COLUMN upload_description TEXT",
@@ -291,14 +277,6 @@ def init_db():
         "ALTER TABLE shorts ADD COLUMN final_score REAL",
         "ALTER TABLE shorts ADD COLUMN score_details_json TEXT",
         "ALTER TABLE shorts ADD COLUMN judge_status TEXT",
-        "ALTER TABLE shorts ADD COLUMN caption_provider TEXT",
-        "ALTER TABLE shorts ADD COLUMN caption_model TEXT",
-        "ALTER TABLE shorts ADD COLUMN caption_language TEXT",
-        "ALTER TABLE shorts ADD COLUMN caption_confidence REAL",
-        "ALTER TABLE shorts ADD COLUMN caption_words_json TEXT",
-        "ALTER TABLE shorts ADD COLUMN caption_cues_json TEXT",
-        "ALTER TABLE shorts ADD COLUMN caption_srt TEXT",
-        "ALTER TABLE shorts ADD COLUMN caption_status TEXT",
         "ALTER TABLE shorts ADD COLUMN series_title TEXT",
         "ALTER TABLE shorts ADD COLUMN series_part_number INTEGER",
         "ALTER TABLE shorts ADD COLUMN series_total_parts INTEGER",
@@ -483,7 +461,6 @@ def delete_short_record(short_id: int) -> bool:
     short = rows[0]
     filename = Path(short["filename"]).name
     (OUTPUTS_DIR / filename).unlink(missing_ok=True)
-    (OUTPUTS_DIR / f"{Path(filename).stem}.srt").unlink(missing_ok=True)
     db_write("DELETE FROM shorts WHERE id=?", (short_id,))
 
     remaining = db_read(
@@ -515,7 +492,7 @@ def delete_source_video(video_id: int) -> bool:
 
     safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", video["youtube_video_id"])
     for partial in OUTPUTS_DIR.glob(f"{safe_id}_short_*"):
-        if partial.suffix in (".mp4", ".srt"):
+        if partial.suffix == ".mp4":
             partial.unlink(missing_ok=True)
 
     Path(source_path).unlink(missing_ok=True)
@@ -545,7 +522,7 @@ def delete_video_record(video_id: int) -> bool:
 
     safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", video["youtube_video_id"])
     for partial in OUTPUTS_DIR.glob(f"{safe_id}_short_*"):
-        if partial.suffix in (".mp4", ".srt"):
+        if partial.suffix == ".mp4":
             partial.unlink(missing_ok=True)
 
     db_write("DELETE FROM videos WHERE id=?", (video_id,))
@@ -565,12 +542,8 @@ def cleanup_cancelled_video(video_id: int, source_started_as_download: bool = Fa
         if row["filename"]
     }
     protected_outputs = set(existing_short_files)
-    protected_outputs.update(
-        f"{Path(filename).stem}.srt"
-        for filename in existing_short_files
-    )
     for partial in OUTPUTS_DIR.glob(f"{safe_id}_short_*"):
-        if partial.suffix in (".mp4", ".srt") and partial.name not in protected_outputs:
+        if partial.suffix == ".mp4" and partial.name not in protected_outputs:
             partial.unlink(missing_ok=True)
 
     source_path = video.get("source_path") or ""
@@ -627,8 +600,6 @@ def effective_snapchat_client_id() -> str:
     return get_setting("snapchat_client_id") or SNAPCHAT_CLIENT_ID
 
 
-SHORT_STATUSES = {"draft", "approved",
-                  "rejected", "exported", "uploaded", "failed"}
 UPLOAD_STATUSES = {"draft", "scheduled", "uploading", "processing", "uploaded", "shared", "ready", "failed"}
 UPLOAD_PLATFORMS = {"youtube", "tiktok", "snapchat"}
 
@@ -718,7 +689,6 @@ def get_short_detail(short_id: int) -> dict:
     if not rows:
         raise ValueError("Short not found.")
     short = rows[0]
-    short["caption_cues"] = parse_json_array(short.get("caption_cues_json", ""))
     uploads = db_read(
         "SELECT * FROM short_uploads WHERE short_id=? ORDER BY created_at DESC, id DESC",
         (short_id,),
@@ -752,7 +722,6 @@ def update_short_metadata(short_id: int, data: dict) -> dict:
     text_fields = {
         "title",
         "description",
-        "caption_text",
         "upload_title",
         "upload_description",
         "scheduled_at",
@@ -811,68 +780,6 @@ def series_badge_config_for_short(short: dict, base_config: Optional[dict] = Non
     return config
 
 
-def validate_caption_cues(cues: list[dict], duration: Optional[float] = None) -> list[dict]:
-    if not isinstance(cues, list):
-        raise ValueError("Caption cues must be a list.")
-    clean = []
-    previous_end = -0.001
-    max_duration = float(duration) if duration is not None else None
-    for cue in cues:
-        if not isinstance(cue, dict):
-            raise ValueError("Each caption cue must be an object.")
-        try:
-            start = float(cue.get("start"))
-            end = float(cue.get("end"))
-        except (TypeError, ValueError):
-            raise ValueError("Caption cue start and end must be numbers.")
-        text = " ".join(str(cue.get("text") or "").split())
-        if start < 0 or end <= start:
-            raise ValueError("Caption cue end must be after start.")
-        if start < previous_end - 0.001:
-            raise ValueError("Caption cues cannot overlap.")
-        if max_duration is not None and end > max_duration + 0.25:
-            raise ValueError("Caption cue is outside the Short duration.")
-        if not text:
-            raise ValueError("Caption cue text cannot be empty.")
-        clean_cue = {
-            "start": round(start, 3),
-            "end": round(end, 3),
-            "text": text,
-        }
-        if cue.get("confidence") is not None:
-            try:
-                clean_cue["confidence"] = round(float(cue.get("confidence")), 4)
-            except (TypeError, ValueError):
-                pass
-        clean.append(clean_cue)
-        previous_end = end
-    return clean
-
-
-def update_short_captions(short_id: int, cues: list[dict]) -> dict:
-    short = get_short_detail(short_id)
-    duration = float(short.get("duration") or 0) or None
-    clean = validate_caption_cues(cues, duration=duration)
-    caption_text = " ".join(cue["text"] for cue in clean).strip()
-    srt = caption_export.generate_srt_from_cues(clean)
-    db_write(
-        "UPDATE shorts SET caption_text=?, caption_cues_json=?, caption_srt=?, caption_status='edited', updated_at=datetime('now') WHERE id=?",
-        (caption_text, json.dumps(clean), srt, short_id),
-    )
-    return get_short_detail(short_id)
-
-
-def update_short_status(short_id: int, status: str) -> dict:
-    if status not in SHORT_STATUSES:
-        raise ValueError("Invalid short status.")
-    approved_at = "datetime('now')" if status == "approved" else "NULL"
-    db_write(
-        f"UPDATE shorts SET status=?, approved_at={approved_at}, updated_at=datetime('now') WHERE id=?",
-        (status, short_id),
-    )
-    return get_short_detail(short_id)
-
-
 def update_short_timing(short_id: int, start_time: float, end_time: float) -> dict:
     start = float(start_time)
     end = float(end_time)
@@ -899,29 +806,7 @@ def regenerate_short(short_id: int, preset_config: Optional[dict] = None) -> dic
     config = series_badge_config_for_short(short, preset_config)
     filename = Path(short.get("filename") or f"short_{short_id}.mp4").name
     output_path = OUTPUTS_DIR / filename
-    srt_path = None
-    caption_cues = parse_json_array(short.get("caption_cues_json", ""))
-    caption_text = (short.get("caption_text") or "").strip()
-    if config.get("captions_enabled", True) and caption_cues:
-        srt_path = OUTPUTS_DIR / f"{Path(filename).stem}.srt"
-        srt_path.write_text(
-            caption_export.generate_srt_from_cues(caption_cues),
-            encoding="utf-8",
-        )
-    elif config.get("captions_enabled", True) and caption_text:
-        srt_path = OUTPUTS_DIR / f"{Path(filename).stem}.srt"
-        srt_path.write_text(
-            generate_srt(
-                [{"start": start, "end": end, "text": caption_text}],
-                start,
-                end,
-                caption_mode="original",
-            ),
-            encoding="utf-8",
-        )
-    elif filename:
-        (OUTPUTS_DIR / f"{Path(filename).stem}.srt").unlink(missing_ok=True)
-    if not export_short_clip(source_path, str(output_path), start, duration, str(srt_path) if srt_path else None, preset=config):
+    if not export_short_clip(source_path, str(output_path), start, duration, None, preset=config):
         db_write(
             "UPDATE shorts SET status='failed', updated_at=datetime('now') WHERE id=?", (short_id,))
         raise ValueError("Short regeneration failed.")
@@ -944,7 +829,6 @@ def get_upload_queue(status_filter: str = "all") -> list[dict]:
         "LEFT JOIN short_uploads ON short_uploads.id = ("
         "SELECT id FROM short_uploads WHERE short_id=shorts.id ORDER BY created_at DESC, id DESC LIMIT 1"
         ") "
-        "WHERE shorts.status IN ('approved','uploaded') OR short_uploads.id IS NOT NULL "
         "ORDER BY shorts.updated_at DESC, shorts.created_at DESC"
     )
     if status_filter and status_filter != "all":
@@ -1122,7 +1006,7 @@ def handle_youtube_callback(code: str) -> dict:
 
 
 def create_youtube_upload(short_id: int, privacy_status: str = "private", scheduled_at: Optional[str] = None) -> dict:
-    short, file_path = _require_approved_short_file(short_id)
+    short, file_path = _require_generated_short_file(short_id)
     publish_kit = build_publish_kit(short, platform="youtube")
     db_write(
         "INSERT INTO short_uploads (short_id, platform, status, privacy_status, scheduled_at, updated_at) "
@@ -1157,10 +1041,8 @@ def create_youtube_upload(short_id: int, privacy_status: str = "private", schedu
     return db_read("SELECT * FROM short_uploads WHERE id=?", (upload_id,))[0]
 
 
-def _require_approved_short_file(short_id: int) -> tuple[dict, Path]:
+def _require_generated_short_file(short_id: int) -> tuple[dict, Path]:
     short = get_short_detail(short_id)
-    if short.get("status") != "approved":
-        raise ValueError("Only approved Shorts can be uploaded.")
     file_path = OUTPUTS_DIR / Path(short.get("filename") or "").name
     if not file_path.exists():
         raise ValueError("Generated Short file is missing.")
@@ -1168,7 +1050,7 @@ def _require_approved_short_file(short_id: int) -> tuple[dict, Path]:
 
 
 def create_tiktok_ready_package(short_id: int, base_url: str = "") -> dict:
-    short, file_path = _require_approved_short_file(short_id)
+    short, file_path = _require_generated_short_file(short_id)
     if not base_url:
         base_url = "http://localhost:8000"
     filename = Path(short.get("filename") or "").name
@@ -1184,7 +1066,7 @@ def create_tiktok_ready_package(short_id: int, base_url: str = "") -> dict:
         "absolute_download_url": absolute_download_url,
         "filename": filename,
         "file_size": file_path.stat().st_size,
-        "instructions": "Download the video, copy the caption, then open TikTok Upload and paste it.",
+        "instructions": "Download the video, copy the post text, then open TikTok Upload and paste it.",
         **publish_kit,
     }
     db_write(
@@ -1207,13 +1089,13 @@ def create_tiktok_ready_package(short_id: int, base_url: str = "") -> dict:
 
 
 def create_snapchat_share(short_id: int, base_url: str = "") -> dict:
-    short, file_path = _require_approved_short_file(short_id)
+    short, file_path = _require_generated_short_file(short_id)
     if not base_url:
         base_url = "http://localhost:8000"
     payload = snapchat_upload.build_share_for_file(
         base_url=base_url,
         filename=Path(short.get("filename") or "").name,
-        caption=short.get("upload_title") or short.get("title") or "",
+        post_text=short.get("upload_title") or short.get("title") or "",
         client_id=effective_snapchat_client_id(),
         duration=float(short.get("duration") or 0),
         file_path=str(file_path),
@@ -1315,9 +1197,8 @@ def refresh_upload_analytics() -> int:
                     "UPDATE short_uploads SET status='failed', platform_video_id=NULL, platform_url=NULL, error_message=? WHERE id=?",
                     ("Video removed from YouTube.", upload["id"])
                 )
-                # Also reset the short's status to approved so we can re-upload
                 db_write(
-                    "UPDATE shorts SET status='approved' WHERE id=?",
+                    "UPDATE shorts SET status='draft' WHERE id=?",
                     (upload["short_id"],)
                 )
                 continue
@@ -1614,8 +1495,8 @@ def is_valid_video(path: str) -> bool:
     return False
 
 
-def build_export_video_filter(srt_path: Optional[str] = None, preset: Optional[dict] = None) -> str:
-    return exporting.build_export_video_filter(srt_path, preset_config_for_export(preset))
+def build_export_video_filter(_unused_legacy_path: Optional[str] = None, preset: Optional[dict] = None) -> str:
+    return exporting.build_export_video_filter(_unused_legacy_path, preset_config_for_export(preset))
 
 
 def export_short_clip(
@@ -1623,7 +1504,7 @@ def export_short_clip(
     output_path: str,
     start: float,
     duration: float,
-    srt_path: Optional[str] = None,
+    _unused_legacy_path: Optional[str] = None,
     video_id: Optional[int] = None,
     preset: Optional[dict] = None,
 ) -> bool:
@@ -1633,7 +1514,7 @@ def export_short_clip(
         output_path,
         start,
         duration,
-        srt_path,
+        _unused_legacy_path,
         preset_config_for_export(preset),
     )
     try:
@@ -1664,14 +1545,14 @@ def extract_audio(video_path: str, audio_path: str, video_id: Optional[int] = No
 # ---------------------------------------------------------------------------
 
 
-def build_whisper_transcription_data(model: str, caption_mode: str = "hinglish") -> dict:
+def build_whisper_transcription_data(model: str) -> dict:
     data = {
         "model": model,
         "response_format": "verbose_json",
         "timestamp_granularities[]": ["word", "segment"],
     }
-    if str(caption_mode or "").lower() != "original" and CAPTION_LANGUAGE_HINT:
-        data["language"] = CAPTION_LANGUAGE_HINT
+    if TRANSCRIPTION_LANGUAGE_HINT:
+        data["language"] = TRANSCRIPTION_LANGUAGE_HINT
     return data
 
 
@@ -1778,17 +1659,11 @@ def segments_from_transcription_response(payload: dict) -> list[dict]:
     return segments
 
 
-def build_gemini_transcription_prompt(caption_mode: str = "hinglish") -> str:
-    if str(caption_mode or "").lower() == "original":
-        script_instruction = (
-            "Keep the original language and script chosen by the transcription model. "
-            "Do not romanize the text. "
-        )
-    else:
-        script_instruction = (
-            "For Hindi, Urdu, Punjabi, or mixed Hindi-English speech, write the original spoken words in Roman Hinglish. "
-            "Keep English words as English. "
-        )
+def build_gemini_transcription_prompt() -> str:
+    script_instruction = (
+        "For Hindi, Urdu, Punjabi, or mixed Hindi-English speech, write the original spoken words in Roman Hinglish. "
+        "Keep English words as English. "
+    )
     return (
         "Transcribe this audio accurately and preserve the speaker's original words. "
         "Do not translate to English, rewrite, or summarize the speech. "
@@ -1797,11 +1672,6 @@ def build_gemini_transcription_prompt(caption_mode: str = "hinglish") -> str:
         '"start" (seconds, float), "end" (seconds, float), "text" (string). '
         "Keep each segment under 15 seconds. Output ONLY the JSON array, no explanation."
     )
-
-
-def captions_enabled_from_body(body: dict) -> bool:
-    return body.get("captions_enabled", True) is not False
-
 
 class GroqRequestTooLarge(RuntimeError):
     pass
@@ -1933,8 +1803,8 @@ def transcribe_with_whisper_local(audio_path: str, video_id: Optional[int] = Non
             "--output_dir",
             str(out_dir),
         ]
-        if CAPTION_LANGUAGE_HINT:
-            command.extend(["--language", CAPTION_LANGUAGE_HINT])
+        if TRANSCRIPTION_LANGUAGE_HINT:
+            command.extend(["--language", TRANSCRIPTION_LANGUAGE_HINT])
         result = run_command(
             command,
             timeout=300,
@@ -2043,47 +1913,6 @@ async def transcribe_with_groq_api(audio_path: str, video_id: Optional[int] = No
         raise RuntimeError(f"Groq transcription failed: {exc}") from exc
 
 
-async def transcribe_with_deepgram_api(audio_path: str, video_id: Optional[int] = None) -> Optional[dict]:
-    """Transcribe through Deepgram Nova with word timestamps and chunking."""
-    if not DEEPGRAM_API_KEY or not Path(audio_path).exists():
-        return None
-    try:
-        duration = get_audio_duration(audio_path)
-        if duration > 480:
-            chunks = split_audio_for_transcription(
-                audio_path,
-                chunk_seconds=480,
-                video_id=video_id,
-            )
-            results = []
-            try:
-                for chunk in chunks:
-                    chunk_path = str(chunk["path"])
-                    result = await deepgram_captions.transcribe_deepgram_file(
-                        chunk_path,
-                        api_key=DEEPGRAM_API_KEY,
-                        model=DEEPGRAM_MODEL,
-                        language=DEEPGRAM_LANGUAGE,
-                    )
-                    results.append((result, float(chunk.get("offset", 0))))
-            finally:
-                for chunk in chunks:
-                    chunk_path = str(chunk["path"])
-                    if chunk_path != audio_path:
-                        Path(chunk_path).unlink(missing_ok=True)
-            return deepgram_captions.merge_chunk_results(results)
-        return await deepgram_captions.transcribe_deepgram_file(
-            audio_path,
-            api_key=DEEPGRAM_API_KEY,
-            model=DEEPGRAM_MODEL,
-            language=DEEPGRAM_LANGUAGE,
-        )
-    except CancelledProcessing:
-        raise
-    except Exception:
-        return None
-
-
 def _segments_to_transcript_result(
     segments: Optional[list[dict]],
     provider: str,
@@ -2098,7 +1927,7 @@ def _segments_to_transcript_result(
     return {
         "provider": provider,
         "model": model,
-        "language": CAPTION_LANGUAGE_HINT,
+        "language": TRANSCRIPTION_LANGUAGE_HINT,
         "confidence": 0.0,
         "segments": segments,
         "words": words,
@@ -2106,21 +1935,11 @@ def _segments_to_transcript_result(
     }
 
 
-def transcribe_audio_for_captions(
+def transcribe_audio_for_clip_selection(
     audio_path: str,
     ai_model: str,
     video_id: Optional[int] = None,
 ) -> Optional[dict]:
-    if DEEPGRAM_API_KEY:
-        loop = asyncio.new_event_loop()
-        try:
-            result = loop.run_until_complete(
-                transcribe_with_deepgram_api(audio_path, video_id=video_id))
-        finally:
-            loop.close()
-        if result and result.get("segments"):
-            return result
-
     if ai_model == "groq" and GROQ_API_KEY:
         loop = asyncio.new_event_loop()
         try:
@@ -2546,267 +2365,14 @@ def fallback_clips(duration: float, count: int = 5) -> list[dict]:
     raise RuntimeError("Legacy clip fallback has been removed. Use the V2 timestamp engine.")
 
 # ---------------------------------------------------------------------------
-# SRT generation
-# ---------------------------------------------------------------------------
-
-
-def seconds_to_srt_time(s: float) -> str:
-    h, rem = divmod(int(s), 3600)
-    m, sec = divmod(rem, 60)
-    ms = int((s - int(s)) * 1000)
-    return f"{h:02d}:{m:02d}:{sec:02d},{ms:03d}"
-
-
-def srt_time_to_seconds(value: str) -> float:
-    hours, minutes, rest = str(value).split(":")
-    seconds, millis = rest.split(",")
-    return (
-        int(hours) * 3600
-        + int(minutes) * 60
-        + int(seconds)
-        + int(millis) / 1000.0
-    )
-
-
-DEVANAGARI_ROMAN_WORDS = {
-    "तुम": "tum",
-    "कैसे": "kaise",
-    "केसे": "kaise",
-    "हो": "ho",
-    "है": "hai",
-    "हैं": "hain",
-    "मैं": "main",
-    "मे": "me",
-    "मुझे": "mujhe",
-    "क्या": "kya",
-    "क्यों": "kyun",
-    "नहीं": "nahi",
-    "हाँ": "haan",
-}
-
-URDU_ROMAN_WORDS = {
-    "تم": "tum",
-    "کیسے": "kaise",
-    "ہو": "ho",
-    "ہے": "hai",
-    "ہیں": "hain",
-    "میں": "main",
-    "مجھے": "mujhe",
-    "کیا": "kya",
-    "کیوں": "kyun",
-    "نہیں": "nahi",
-    "ہاں": "haan",
-}
-
-DEVANAGARI_ROMAN_CHARS = {
-    "अ": "a", "आ": "aa", "इ": "i", "ई": "ee", "उ": "u", "ऊ": "oo",
-    "ए": "e", "ऐ": "ai", "ओ": "o", "औ": "au",
-    "क": "k", "ख": "kh", "ग": "g", "घ": "gh", "च": "ch", "छ": "chh",
-    "ज": "j", "झ": "jh", "ट": "t", "ठ": "th", "ड": "d", "ढ": "dh",
-    "त": "t", "थ": "th", "द": "d", "ध": "dh", "न": "n", "प": "p",
-    "फ": "f", "ब": "b", "भ": "bh", "म": "m", "य": "y", "र": "r",
-    "ल": "l", "व": "v", "श": "sh", "ष": "sh", "स": "s", "ह": "h",
-    "ा": "a", "ि": "i", "ी": "ee", "ु": "u", "ू": "oo", "े": "e",
-    "ै": "ai", "ो": "o", "ौ": "au", "ं": "n", "ँ": "n", "़": "",
-    "्": "", "।": ".", "॥": ".",
-}
-
-URDU_ROMAN_CHARS = {
-    "ا": "a", "آ": "aa", "ب": "b", "پ": "p", "ت": "t", "ٹ": "t",
-    "ث": "s", "ج": "j", "چ": "ch", "ح": "h", "خ": "kh", "د": "d",
-    "ڈ": "d", "ذ": "z", "ر": "r", "ڑ": "r", "ز": "z", "ژ": "zh",
-    "س": "s", "ش": "sh", "ص": "s", "ض": "z", "ط": "t", "ظ": "z",
-    "ع": "a", "غ": "gh", "ف": "f", "ق": "q", "ک": "k", "گ": "g",
-    "ل": "l", "م": "m", "ن": "n", "ں": "n", "و": "o", "ہ": "h",
-    "ھ": "h", "ء": "", "ی": "i", "ے": "e", "َ": "", "ُ": "", "ِ": "",
-}
-
-
-def romanize_caption_text(text: str) -> str:
-    romanized = str(text or "")
-    for source, replacement in {**DEVANAGARI_ROMAN_WORDS, **URDU_ROMAN_WORDS}.items():
-        romanized = romanized.replace(source, replacement)
-
-    output = []
-    for char in romanized:
-        if "\u0900" <= char <= "\u097f":
-            output.append(DEVANAGARI_ROMAN_CHARS.get(char, " "))
-        elif "\u0600" <= char <= "\u06ff":
-            output.append(URDU_ROMAN_CHARS.get(char, " "))
-        else:
-            output.append(char)
-    return re.sub(r"\s+", " ", "".join(output)).strip()
-
-
-def normalize_caption_text(text: str, caption_mode: str = "hinglish") -> str:
-    cleaned = " ".join(str(text or "").split())
-    if str(caption_mode or "").lower() == "original":
-        return cleaned
-    return romanize_caption_text(cleaned)
-
-
-def wrap_caption_text(text: str) -> list[list[str]]:
-    lines = textwrap.wrap(
-        " ".join(str(text or "").split()),
-        width=CAPTION_MAX_LINE_LENGTH,
-        break_long_words=True,
-        break_on_hyphens=False,
-    )
-    return [
-        lines[i:i + CAPTION_MAX_LINES]
-        for i in range(0, len(lines), CAPTION_MAX_LINES)
-    ]
-
-
-def split_caption_text_units(text: str, duration: float) -> list[str]:
-    words = str(text or "").split()
-    if not words:
-        return []
-    word_unit_count = (len(words) + CAPTION_MAX_WORDS - 1) // CAPTION_MAX_WORDS
-    if word_unit_count <= 1:
-        return [" ".join(words)]
-    unit_count = int(max(
-        1,
-        int((max(0.1, duration) + CAPTION_MAX_SECONDS - 0.001) // CAPTION_MAX_SECONDS),
-        word_unit_count,
-    ))
-    unit_count = min(unit_count, len(words))
-    units = []
-    for index in range(unit_count):
-        start = round(index * len(words) / unit_count)
-        end = round((index + 1) * len(words) / unit_count)
-        chunk = " ".join(words[start:end]).strip()
-        if chunk:
-            units.append(chunk)
-    return units
-
-
-def _caption_units_from_word_timestamps(
-    segment: dict,
-    clip_start: float,
-    clip_end: float,
-    caption_mode: str,
-) -> list[dict]:
-    words = []
-    for raw_word in segment.get("words") or []:
-        if not isinstance(raw_word, dict):
-            continue
-        try:
-            start = float(raw_word.get("start", 0))
-            end = float(raw_word.get("end", start))
-        except (TypeError, ValueError):
-            continue
-        if end <= clip_start or start >= clip_end:
-            continue
-        text = normalize_caption_text(
-            str(raw_word.get("word") or raw_word.get("text") or ""),
-            caption_mode=caption_mode,
-        )
-        if not text or is_transcription_instruction_leak(text):
-            continue
-        words.append({
-            "start": max(0.0, start - clip_start),
-            "end": max(0.0, min(clip_end, end) - clip_start),
-            "word": text,
-        })
-    if not words:
-        return []
-
-    units = []
-    current: list[dict] = []
-
-    def flush_current() -> None:
-        if not current:
-            return
-        text = " ".join(word["word"] for word in current).strip()
-        if not text or is_transcription_instruction_leak(text):
-            return
-        start = float(current[0]["start"])
-        end = max(float(current[-1]["end"]), start + 0.35)
-        units.append({"start": start, "end": end, "text": text})
-
-    for word in words:
-        if current:
-            gap = float(word["start"]) - float(current[-1]["end"])
-            duration = float(current[-1]["end"]) - float(current[0]["start"])
-            if (
-                gap > CAPTION_WORD_GAP_SECONDS
-                or len(current) >= CAPTION_MAX_WORDS
-                or duration >= CAPTION_MAX_SECONDS
-            ):
-                flush_current()
-                current = []
-        current.append(word)
-    flush_current()
-    return units
-
-
-def generate_srt(
-    segments: list[dict],
-    clip_start: float,
-    clip_end: float,
-    caption_mode: str = "hinglish",
-) -> str:
-    lines = []
-    idx = 1
-    for seg in segments:
-        ss = float(seg.get("start", 0))
-        se = float(seg.get("end", ss))
-        if se <= clip_start or ss >= clip_end:
-            continue
-        rs = max(0, ss - clip_start)
-        re = min(clip_end - clip_start, se - clip_start)
-        text = seg.get("text", "").strip()
-        if not text:
-            continue
-        if is_transcription_instruction_leak(text):
-            continue
-        word_units = _caption_units_from_word_timestamps(
-            seg,
-            clip_start,
-            clip_end,
-            caption_mode,
-        )
-        if word_units:
-            for unit in word_units:
-                for caption_lines in wrap_caption_text(unit["text"]):
-                    lines += [
-                        str(idx),
-                        f"{seconds_to_srt_time(unit['start'])} --> {seconds_to_srt_time(unit['end'])}",
-                        *caption_lines,
-                        "",
-                    ]
-                    idx += 1
-            continue
-        span = max(0.1, re - rs)
-        caption_units = split_caption_text_units(
-            normalize_caption_text(text, caption_mode=caption_mode),
-            span,
-        )
-        if not caption_units:
-            continue
-        for unit_idx, caption_unit in enumerate(caption_units):
-            unit_start = rs + (span * unit_idx / len(caption_units))
-            unit_end = rs + (span * (unit_idx + 1) / len(caption_units))
-            for caption_lines in wrap_caption_text(caption_unit):
-                lines += [
-                    str(idx),
-                    f"{seconds_to_srt_time(unit_start)} --> {seconds_to_srt_time(unit_end)}",
-                    *caption_lines,
-                    "",
-                ]
-                idx += 1
-    return "\n".join(lines)
-
 # ---------------------------------------------------------------------------
 # Core processing pipeline
 # ---------------------------------------------------------------------------
 
 
-async def process_video(video_id: int, source_path: str, captions_enabled: bool = True):
+async def process_video(video_id: int, source_path: str):
     def _run():
-        _process_video_sync(video_id, source_path,
-                            captions_enabled=captions_enabled)
+        _process_video_sync(video_id, source_path)
     await asyncio.get_event_loop().run_in_executor(None, _run)
 
 
@@ -2818,7 +2384,6 @@ def _process_video_sync(
     video_id: int,
     source_path: str,
     source_started_as_download: bool = False,
-    captions_enabled: bool = True,
 ):
     """Full pipeline with live step tracking: validate → audio → transcribe → score → export."""
     _, created_job = get_or_start_video_job(video_id)
@@ -2881,24 +2446,24 @@ def _process_video_sync(
             step(1, "done")
         else:
             step(
-                1, "error", "FFmpeg audio extraction failed — clips will have no subtitles")
+                1, "error", "FFmpeg audio extraction failed, so clips cannot be selected")
         ensure_not_cancelled(video_id)
 
         # ── Step 2: Transcribe ───────────────────────────────────────────────
-        caption_transcript: Optional[dict] = None
+        transcript: Optional[dict] = None
         if audio_ok:
-            step(2, "running", "Deepgram captions..." if DEEPGRAM_API_KEY else "Transcribing audio...")
-            caption_transcript = transcribe_audio_for_captions(
+            step(2, "running", "Transcribing audio...")
+            transcript = transcribe_audio_for_clip_selection(
                 audio_path,
                 ai_model=ai_model,
                 video_id=video_id,
             )
-            if caption_transcript and caption_transcript.get("segments"):
-                segments = caption_transcript["segments"]
-                provider = caption_transcript.get("provider") or "transcription"
-                model = caption_transcript.get("model") or ""
-                confidence = float(caption_transcript.get("confidence") or 0)
-                word_count = len(caption_transcript.get("words") or [])
+            if transcript and transcript.get("segments"):
+                segments = transcript["segments"]
+                provider = transcript.get("provider") or "transcription"
+                model = transcript.get("model") or ""
+                confidence = float(transcript.get("confidence") or 0)
+                word_count = len(transcript.get("words") or [])
                 detail = f"{provider}"
                 if model:
                     detail += f" {model}"
@@ -2971,29 +2536,8 @@ def _process_video_sync(
                 enabled=export_config.get("series_badge_enabled", True),
             )
             clip_export_config = {**export_config, **badge}
-            caption_cues = []
-            caption_words = []
-            srt_content = ""
-            if captions_enabled and segments:
-                caption_cues = caption_line_builder.build_caption_cues(
-                    segments,
-                    start,
-                    end,
-                )
-                srt_content = caption_export.generate_srt_from_cues(caption_cues)
-                caption_words = [
-                    word for word in (caption_transcript or {}).get("words", [])
-                    if float(word.get("end", word.get("start", 0))) > start
-                    and float(word.get("start", 0)) < end
-                ]
-                if not srt_content.strip():
-                    srt_content = generate_srt(segments, start, end)
-            srt_path = None
-            if srt_content.strip():
-                srt_path = str(OUTPUTS_DIR / f"{safe_id}_short_{idx:02d}.srt")
-                Path(srt_path).write_text(srt_content, encoding="utf-8")
             out_filename = f"{safe_id}_short_{idx:02d}.mp4"
-            if export_short_clip(source_path, str(OUTPUTS_DIR / out_filename), start, clip_dur, srt_path, video_id=video_id, preset=clip_export_config):
+            if export_short_clip(source_path, str(OUTPUTS_DIR / out_filename), start, clip_dur, None, video_id=video_id, preset=clip_export_config):
                 enriched_clip = shorts_director.enrich_clip_metadata({
                     **clip,
                     "title": clip.get("title") or f"Highlight {idx}",
@@ -3009,21 +2553,17 @@ def _process_video_sync(
                 )[:500]
                 db_write(
                     "INSERT INTO shorts "
-                    "(video_id, filename, start_time, end_time, duration, caption_text, title, description, "
+                    "(video_id, filename, start_time, end_time, duration, title, description, "
                     "virality_score, completion_score, hook_type, selection_reason, status, "
                     "original_start_time, original_end_time, upload_title, upload_description, "
-                    "timestamp_engine, candidate_source, final_score, score_details_json, judge_status, "
-                    "caption_provider, caption_model, caption_language, caption_confidence, "
-                    "caption_words_json, caption_cues_json, caption_srt, caption_status, updated_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))",
+                    "timestamp_engine, candidate_source, final_score, score_details_json, judge_status, updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))",
                     (
                         video_id,
                         out_filename,
                         start,
                         end,
                         clip_dur,
-                        (" ".join(cue.get("text", "") for cue in caption_cues).strip()
-                         or enriched_clip.get("text", ""))[:500],
                         title,
                         description,
                         int(enriched_clip.get("virality_score", 0) or 0),
@@ -3040,14 +2580,6 @@ def _process_video_sync(
                         float(enriched_clip.get("final_score", 0) or 0),
                         enriched_clip.get("score_details_json", "")[:4000],
                         enriched_clip.get("judge_status", "")[:30],
-                        (caption_transcript or {}).get("provider", "")[:40],
-                        (caption_transcript or {}).get("model", "")[:80],
-                        (caption_transcript or {}).get("language", "")[:80],
-                        float((caption_transcript or {}).get("confidence", 0) or 0),
-                        json.dumps(caption_words)[:12000],
-                        json.dumps(caption_cues)[:12000],
-                        srt_content,
-                        (caption_transcript or {}).get("status", "")[:40],
                     ),
                 )
                 db_write(
@@ -3101,7 +2633,7 @@ def _process_video_sync(
 # yt-dlp download pipeline
 # ---------------------------------------------------------------------------
 
-def _download_and_process_sync(video_id: int, captions_enabled: bool = True):
+def _download_and_process_sync(video_id: int):
     """Download from YouTube via yt-dlp, then run the full processing pipeline."""
     start_video_job(video_id)
     rows = db_read("SELECT * FROM videos WHERE id=?", (video_id,))
@@ -3182,18 +2714,16 @@ def _download_and_process_sync(video_id: int, captions_enabled: bool = True):
             video_id,
             output_path,
             source_started_as_download=True,
-            captions_enabled=captions_enabled,
         )
     finally:
         finish_video_job(video_id)
 
 
-async def download_and_process(video_id: int, captions_enabled: bool = True):
+async def download_and_process(video_id: int):
     await asyncio.get_event_loop().run_in_executor(
         None,
         _download_and_process_sync,
         video_id,
-        captions_enabled,
     )
 
 # ---------------------------------------------------------------------------
@@ -3382,8 +2912,7 @@ async def download_youtube_url_route(background_tasks: BackgroundTasks, request:
         video_id = db_read(
             "SELECT id FROM videos WHERE youtube_video_id=?", (yt_id,))[0]["id"]
 
-    background_tasks.add_task(
-        download_and_process, video_id, captions_enabled_from_body(body))
+    background_tasks.add_task(download_and_process, video_id)
     return {"message": "Download and clipping started.", "video_id": video_id}
 
 
@@ -3429,12 +2958,7 @@ async def download_yt_route(video_id: int, background_tasks: BackgroundTasks, re
     video = rows[0]
     if video["status"] in ("processing", "downloading"):
         raise HTTPException(status_code=409, detail="Already in progress.")
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    background_tasks.add_task(download_and_process,
-                              video_id, captions_enabled_from_body(body))
+    background_tasks.add_task(download_and_process, video_id)
     return {"message": "Download started in background."}
 
 
@@ -3449,79 +2973,12 @@ async def process_video_route(video_id: int, background_tasks: BackgroundTasks, 
             status_code=400, detail="Source file not uploaded yet.")
     if video["status"] in ("processing", "downloading"):
         raise HTTPException(status_code=409, detail="Already in progress.")
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
     background_tasks.add_task(
         process_video,
         video_id,
         video["source_path"],
-        captions_enabled_from_body(body),
     )
     return {"message": "Processing started in background."}
-
-
-@app.get("/short/{short_id}/review", response_class=HTMLResponse)
-async def review_short_page(short_id: int, request: Request):
-    try:
-        short = get_short_detail(short_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-    return templates.TemplateResponse(
-        request,
-        "review.html",
-        context={
-            "short": short,
-            "presets": list_presets(),
-            "default_preset": get_default_preset(),
-            "youtube_connected": is_youtube_connected(),
-            "snapchat_configured": is_snapchat_configured(),
-        },
-    )
-
-
-@app.post("/short/{short_id}/metadata")
-async def update_short_metadata_route(short_id: int, request: Request):
-    try:
-        return {"short": update_short_metadata(short_id, await request.json())}
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-
-
-@app.post("/short/{short_id}/captions")
-async def update_short_captions_route(short_id: int, request: Request):
-    try:
-        body = await request.json()
-        return {"short": update_short_captions(short_id, body.get("cues") or [])}
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-
-@app.post("/short/{short_id}/status")
-async def update_short_status_route(short_id: int, request: Request):
-    body = await request.json()
-    try:
-        return {"short": update_short_status(short_id, str(body.get("status") or ""))}
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-
-@app.post("/short/{short_id}/timing")
-async def update_short_timing_route(short_id: int, request: Request):
-    body = await request.json()
-    try:
-        return {"short": update_short_timing(short_id, body.get("start_time"), body.get("end_time"))}
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-
-@app.post("/short/{short_id}/regenerate")
-async def regenerate_short_route(short_id: int):
-    try:
-        return {"short": regenerate_short(short_id)}
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.get("/queue", response_class=HTMLResponse)

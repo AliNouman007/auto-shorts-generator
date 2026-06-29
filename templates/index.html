@@ -145,18 +145,6 @@
         </div>
         <div class="preset-grid">
           <label class="settings-field checkbox-field">
-            <span class="field-label">Captions</span>
-            <input id="preset-captions-enabled" type="checkbox" {% if output_config.captions_enabled is not defined or output_config.captions_enabled %}checked{% endif %} />
-          </label>
-          <label class="settings-field">
-            <span class="field-label">Caption Font</span>
-            <input id="preset-font-size" class="field-input" type="number" min="6" max="48" value="{{ output_config.caption_font_size | default(10) }}" />
-          </label>
-          <label class="settings-field">
-            <span class="field-label">Caption Margin</span>
-            <input id="preset-margin-v" class="field-input" type="number" min="0" max="240" value="{{ output_config.caption_margin_v | default(40) }}" />
-          </label>
-          <label class="settings-field checkbox-field">
             <span class="field-label">Top Part Badge</span>
             <input id="preset-series-badge-enabled" type="checkbox" {% if output_config.series_badge_enabled is not defined or output_config.series_badge_enabled %}checked{% endif %} />
           </label>
@@ -309,17 +297,6 @@
             {{ video.status }}
           </span>
 
-          <label class="caption-toggle" for="captions-toggle-{{ video.id }}">
-            <input
-              type="checkbox"
-              id="captions-toggle-{{ video.id }}"
-              checked
-              {% if video.status in ('processing','downloading') %}disabled{% endif %}
-            />
-            <span class="caption-toggle-ui" aria-hidden="true"></span>
-            <span>Captions</span>
-          </label>
-
           {% if video.status not in ('processing', 'downloading') %}
           <button class="btn btn-danger btn-sm btn-icon" title="Remove video from list" aria-label="Remove video from list" onclick="deleteVideoRecord({{ video.id }}, this)">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
@@ -410,9 +387,7 @@
           {% for short in video.shorts %}
           <div class="short-card short-card-{{ short.status or 'draft' }}" data-short-id="{{ short.id }}">
             <div class="short-card-top">
-              {% if (short.status or 'draft') not in ['approved', 'rejected'] %}
               <span class="short-status short-status-{{ short.status or 'draft' }}">{{ short.status or 'draft' }}</span>
-              {% endif %}
               {% if short.latest_upload and short.latest_upload.status %}
               <span class="short-status short-status-{{ short.latest_upload.status }}">{{ short.latest_upload.status }}</span>
               {% endif %}
@@ -450,12 +425,6 @@
               {% if has_v2_score %}
               <span class="score-pill">Score {{ (short.final_score * 100)|round|int }}%</span>
               {% endif %}
-              {% if short.caption_provider is defined and short.caption_provider %}
-              <span class="score-pill">Captions {{ short.caption_provider }}</span>
-              {% endif %}
-              {% if short.caption_status is defined and short.caption_status %}
-              <span class="score-pill">{{ short.caption_status }}</span>
-              {% endif %}
             </div>
             {% endif %}
             {% if short.selection_reason %}
@@ -466,14 +435,9 @@
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 3 20 12 6 21 6 3"/></svg>
                 Play
               </button>
-              <a href="/short/{{ short.id }}/review" class="btn btn-secondary btn-sm" style="text-decoration:none">Review</a>
-              <button class="btn btn-secondary btn-sm" onclick="updateShortStatus({{ short.id }}, 'approved', this)">Approve</button>
-              <button class="btn btn-danger btn-sm" onclick="updateShortStatus({{ short.id }}, 'rejected', this)">Reject</button>
-              {% if (short.status or 'draft') == 'approved' %}
               <button class="btn btn-ghost btn-sm" onclick="uploadShort({{ short.id }}, 'youtube', this)">Upload to YouTube</button>
               <button class="btn btn-ghost btn-sm" onclick="prepareTikTok({{ short.id }}, this)">Prepare for TikTok</button>
               <button class="btn btn-ghost btn-sm" onclick="shareToSnapchat({{ short.id }}, this)">Share to Snapchat</button>
-              {% endif %}
               <a href="/download/{{ short.filename }}" class="btn btn-ghost btn-sm" style="text-decoration:none" download>
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
                 Download

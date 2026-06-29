@@ -2,9 +2,6 @@ import copy
 
 
 DEFAULT_PRESET_CONFIG = {
-    "captions_enabled": True,
-    "caption_font_size": 10,
-    "caption_margin_v": 40,
     "width": 1080,
     "height": 1920,
     "encoder_preset": "veryfast",
@@ -46,19 +43,6 @@ def normalize_preset_config(config=None):
     if isinstance(config, dict):
         normalized.update({k: v for k, v in config.items() if v is not None})
 
-    normalized["captions_enabled"] = normalized.get("captions_enabled") is not False
-    normalized["caption_font_size"] = _coerce_int(
-        normalized.get("caption_font_size"),
-        DEFAULT_PRESET_CONFIG["caption_font_size"],
-        6,
-        48,
-    )
-    normalized["caption_margin_v"] = _coerce_int(
-        normalized.get("caption_margin_v"),
-        DEFAULT_PRESET_CONFIG["caption_margin_v"],
-        0,
-        240,
-    )
     normalized["width"] = _coerce_int(normalized.get("width"), 1080, 360, 2160)
     normalized["height"] = _coerce_int(normalized.get("height"), 1920, 640, 3840)
     normalized["crf"] = _coerce_int(normalized.get("crf"), 24, 16, 40)

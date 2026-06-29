@@ -7,7 +7,7 @@ AI-powered tool that monitors your YouTube channel and auto-generates 9:16 verti
 - Download source videos directly from YouTube via **yt-dlp** (no manual upload needed)
 - AI transcription: OpenAI Whisper or Google Gemini Flash
 - Groq Whisper transcription option
-- FFmpeg pipeline: center-crop to 9:16, scale to 1080x1920, subtitle burn-in
+- FFmpeg pipeline: center-crop to 9:16 and scale to 1080x1920
 - Live step-by-step progress tracking in the dashboard
 - SQLite database — no migrations, auto-created on startup
 

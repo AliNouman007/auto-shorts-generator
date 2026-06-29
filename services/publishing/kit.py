@@ -12,12 +12,6 @@ STOPWORDS = {
     "where", "with", "you", "your",
 }
 
-CAPTION_MARKERS = {
-    "haan", "han", "matlab", "bol", "bolta", "bolti", "raha", "rahi",
-    "hoon", "hun", "hai", "tha", "thi", "phir", "fir", "audience",
-    "laugh", "hassi", "hans", "umm", "uh", "yeah", "okay",
-}
-
 GENERIC_TITLES = {
     "funny clip", "selected clip", "highlight", "untitled short", "complete short",
     "source video", "studio workflow",
@@ -71,19 +65,20 @@ def has_stage_comedy_context(*values: str) -> bool:
     return bool(tokens & STAGE_COMEDY_WORDS)
 
 
-def looks_like_caption_text(value: str, caption_text: str = "") -> bool:
+def looks_like_transcript_text(value: str) -> bool:
     clean = compact_spaces(strip_hashtags(value)).lower()
     if not clean:
         return False
     if has_non_english_script(clean):
         return True
-    caption = compact_spaces(caption_text).lower()
-    if caption and (clean in caption or caption in clean):
-        return True
     text_words = words(clean)
     if len(text_words) >= 11 and not re.search(r"[.!?]", clean):
         return True
-    marker_hits = sum(1 for word in text_words if word in CAPTION_MARKERS)
+    marker_hits = sum(1 for word in text_words if word in {
+        "haan", "han", "matlab", "bol", "bolta", "bolti", "raha", "rahi",
+        "hoon", "hun", "hai", "tha", "thi", "phir", "fir", "audience",
+        "laugh", "hassi", "hans", "umm", "uh", "yeah", "okay",
+    })
     return marker_hits >= 3
 
 
@@ -103,14 +98,13 @@ def dynamic_title(short: dict) -> str:
 def dynamic_description(short: dict, title: str) -> tuple[str, list[str]]:
     notes = []
     raw = compact_spaces(short.get("upload_description") or short.get("description") or "")
-    caption_text = compact_spaces(short.get("caption_text") or "")
     candidate = strip_hashtags(raw)
-    if candidate and not looks_like_caption_text(candidate, caption_text):
+    if candidate and not looks_like_transcript_text(candidate):
         english_candidate = english_text(candidate)
         if english_candidate and len(words(english_candidate)) >= 3:
             return english_candidate[:180].strip(), notes
     if candidate:
-        notes.append("description_was_caption_like")
+        notes.append("description_was_transcript_like")
     source = compact_spaces(short.get("source_title") or "")
     reason = compact_spaces(short.get("selection_reason") or "")
     hook_type = compact_spaces(str(short.get("hook_type") or "")).replace("_", " ")
@@ -124,7 +118,7 @@ def dynamic_description(short: dict, title: str) -> tuple[str, list[str]]:
         else:
             base = "A stage comedy moment with a live audience reaction."
         return base[:180].strip(), notes
-    if reason and not looks_like_caption_text(reason, caption_text):
+    if reason and not looks_like_transcript_text(reason):
         base = english_text(reason)
     elif source_english:
         base = f"{title} from {source_english}"
@@ -146,8 +140,7 @@ def dynamic_hashtags(short: dict, existing: list[str] | None = None, limit: int 
     raw_title = compact_spaces(short.get("upload_title") or short.get("title") or "")
     title = "" if is_generic_title(raw_title) else dynamic_title(short)
     raw_description = strip_hashtags(short.get("upload_description") or short.get("description") or "")
-    caption_text = compact_spaces(short.get("caption_text") or "")
-    if looks_like_caption_text(raw_description, caption_text):
+    if looks_like_transcript_text(raw_description):
         raw_description = " ".join(word for word in words(raw_description) if word in STAGE_COMEDY_WORDS)
     text = " ".join([
         title,
@@ -177,16 +170,15 @@ def build_publish_kit(short: dict, platform: str = "tiktok") -> dict:
     description, quality_notes = dynamic_description(short, title)
     hashtags = dynamic_hashtags({**short, "publish_description": description}, existing=existing)
     hashtags_text = " ".join(hashtags)
-    caption_parts = [part for part in (title, description, hashtags_text) if part]
-    final_caption = "\n\n".join(caption_parts).strip()
+    post_parts = [part for part in (title, description, hashtags_text) if part]
+    post_text = "\n\n".join(post_parts).strip()
     return {
         "platform": platform,
         "title": title,
         "description": description,
-        "caption": final_caption[:2200],
-        "final_caption": final_caption[:2200],
+        "post_text": post_text[:2200],
         "hashtags": hashtags,
         "hashtags_text": hashtags_text,
-        "copy_all_text": final_caption[:2200],
+        "copy_all_text": post_text[:2200],
         "quality_notes": quality_notes,
     }

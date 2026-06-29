@@ -3,10 +3,6 @@ from pathlib import Path
 from .presets import normalize_preset_config
 
 
-def _escape_subtitle_path(path):
-    return str(path).replace("\\", "/").replace(":", "\\:")
-
-
 def _escape_drawtext_text(value):
     return (
         str(value or "")
@@ -31,7 +27,7 @@ def _drawtext_font_option():
     return "font='Arial'"
 
 
-def build_export_video_filter(srt_path=None, preset=None):
+def build_export_video_filter(_unused_legacy_path=None, preset=None):
     config = normalize_preset_config(preset)
     width = config["width"]
     height = config["height"]
@@ -44,14 +40,6 @@ def build_export_video_filter(srt_path=None, preset=None):
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black@0[fg];"
         "[bg][fg]overlay=(W-w)/2:(H-h)/2"
     )
-    if srt_path and Path(srt_path).exists():
-        escaped = _escape_subtitle_path(srt_path)
-        vf += (
-            f",subtitles='{escaped}':force_style="
-            f"'FontName=Arial,FontSize={config['caption_font_size']},Alignment=2,"
-            f"MarginV={config['caption_margin_v']},Bold=1,"
-            "PrimaryColour=&H00FFFFFF&,OutlineColour=&H00000000&,Outline=2'"
-        )
     badge_label = str(config.get("series_badge_label") or "").strip()
     badge_text = str(config.get("series_badge_text") or "").strip()
     if config.get("series_badge_enabled") and badge_text:
@@ -70,14 +58,14 @@ def build_export_video_filter(srt_path=None, preset=None):
     return vf
 
 
-def build_export_command(source_path, output_path, start, duration, srt_path=None, preset=None):
+def build_export_command(source_path, output_path, start, duration, _unused_legacy_path=None, preset=None):
     config = normalize_preset_config(preset)
     return [
         "ffmpeg", "-y",
         "-ss", str(start),
         "-i", source_path,
         "-t", str(duration),
-        "-vf", build_export_video_filter(srt_path, config),
+        "-vf", build_export_video_filter(_unused_legacy_path, config),
         "-c:v", "libx264", "-preset", config["encoder_preset"], "-crf", str(config["crf"]),
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart",

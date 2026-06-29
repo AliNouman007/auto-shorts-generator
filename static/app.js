@@ -96,16 +96,6 @@ async function saveDefaultPreset(btn) {
     .split("x")
     .map((value) => parseInt(value, 10));
   const config = {
-    captions_enabled:
-      document.getElementById("preset-captions-enabled")?.checked !== false,
-    caption_font_size: parseInt(
-      document.getElementById("preset-font-size")?.value || "10",
-      10,
-    ),
-    caption_margin_v: parseInt(
-      document.getElementById("preset-margin-v")?.value || "40",
-      10,
-    ),
     series_badge_enabled:
       document.getElementById("preset-series-badge-enabled")?.checked !== false,
     series_badge_label:
@@ -345,11 +335,6 @@ async function checkYoutube() {
 // Download from YouTube + auto-process
 // ---------------------------------------------------------------------------
 
-function captionsEnabled(videoId) {
-  const input = document.getElementById(`captions-toggle-${videoId}`);
-  return !input || input.checked;
-}
-
 async function downloadAndProcess(videoId, btn) {
   btn.disabled = true;
   btn.innerHTML = '<span class="spin"></span> Starting download…';
@@ -358,7 +343,6 @@ async function downloadAndProcess(videoId, btn) {
     const res = await fetch(`/download-yt/${videoId}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ captions_enabled: captionsEnabled(videoId) }),
     });
     const data = await res.json();
     if (!res.ok) {
@@ -399,7 +383,7 @@ async function downloadYoutubeUrl(btn) {
     const res = await fetch("/youtube-url", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url, captions_enabled: true }),
+      body: JSON.stringify({ url }),
     });
     const data = await res.json();
     if (!res.ok) {
@@ -485,7 +469,6 @@ async function processVideo(videoId, btn) {
     const res = await fetch(`/process/${videoId}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ captions_enabled: captionsEnabled(videoId) }),
     });
     const data = await res.json();
     if (!res.ok) {
@@ -667,107 +650,6 @@ function escJsString(s) {
   return String(s).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
 }
 
-function collectReviewMetadata() {
-  const title = document.getElementById("review-title")?.value || "";
-  const description = document.getElementById("review-description")?.value || "";
-  return {
-    title,
-    upload_title: title,
-    description,
-    upload_description: description,
-    series_badge_enabled:
-      document.getElementById("review-series-badge-enabled")?.checked !== false,
-    series_badge_label:
-      document.getElementById("review-series-badge-label")?.value ||
-      "Funniest Moment",
-    series_badge_text:
-      document.getElementById("review-series-badge-text")?.value || "",
-  };
-}
-
-async function saveReviewMetadata(shortId) {
-  return fetchJson(`/short/${shortId}/metadata`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(collectReviewMetadata()),
-  });
-}
-
-async function saveReviewShort(shortId, btn) {
-  const done = setButtonBusy(btn, "Saving…");
-  try {
-    await saveReviewMetadata(shortId);
-    showToast("Short metadata saved.", "success");
-  } catch (e) {
-    showToast(e.message || "Could not save Short metadata", "error");
-  } finally {
-    done();
-  }
-}
-
-async function saveShortTiming(shortId, btn) {
-  const done = setButtonBusy(btn, "Saving…");
-  const start = parseFloat(
-    document.getElementById("review-start")?.value || "0",
-  );
-  const end = parseFloat(document.getElementById("review-end")?.value || "0");
-  try {
-    await fetchJson(`/short/${shortId}/timing`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ start_time: start, end_time: end }),
-    });
-    showToast("Short timing saved.", "success");
-  } catch (e) {
-    showToast(e.message || "Could not save timing", "error");
-  } finally {
-    done();
-  }
-}
-
-async function updateShortStatus(shortId, status, btn) {
-  const labels = {
-    approved: "Approving…",
-    rejected: "Rejecting…",
-    draft: "Saving…",
-  };
-  const done = setButtonBusy(btn, labels[status] || "Saving…");
-  try {
-    await fetchJson(`/short/${shortId}/status`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ status }),
-    });
-    showToast(`Short marked ${status}.`, "success");
-    reloadSoon();
-  } catch (e) {
-    showToast(e.message || "Could not update Short status", "error");
-    done();
-  }
-}
-
-async function regenerateShort(shortId, btn) {
-  const done = setButtonBusy(btn, "Regenerating…");
-  const start = parseFloat(
-    document.getElementById("review-start")?.value || "0",
-  );
-  const end = parseFloat(document.getElementById("review-end")?.value || "0");
-  try {
-    await saveReviewMetadata(shortId);
-    await fetchJson(`/short/${shortId}/timing`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ start_time: start, end_time: end }),
-    });
-    await fetchJson(`/short/${shortId}/regenerate`, { method: "POST" });
-    showToast("Short regenerated with current edits.", "success");
-    reloadSoon();
-  } catch (e) {
-    showToast(e.message || "Could not regenerate Short", "error");
-    done();
-  }
-}
-
 async function uploadShortYoutubeLegacy(shortId, btn) {
   const done = setButtonBusy(btn, "Uploading…");
   try {
@@ -915,11 +797,11 @@ function ensurePublishKitDrawer() {
         <div id="publish-kit-hashtags" class="publish-kit-tags"></div>
       </div>
       <div class="publish-kit-field">
-        <div class="publish-kit-field-head"><span>Final Caption</span>${iconButton("copy_all_text", "Copy final caption")}</div>
-        <div id="publish-kit-caption" class="publish-kit-value publish-kit-caption"></div>
+        <div class="publish-kit-field-head"><span>Post Text</span>${iconButton("copy_all_text", "Copy post text")}</div>
+        <div id="publish-kit-post-text" class="publish-kit-value publish-kit-post-text"></div>
       </div>
       <div class="publish-kit-actions">
-        <button id="publish-kit-copy-all" class="btn btn-primary btn-icon" onclick="copyPublishKitField('copy_all_text', this)" title="Copy final caption" aria-label="Copy final caption">${iconSvg("copy")}</button>
+        <button id="publish-kit-copy-all" class="btn btn-primary btn-icon" onclick="copyPublishKitField('copy_all_text', this)" title="Copy post text" aria-label="Copy post text">${iconSvg("copy")}</button>
         <a id="publish-kit-download" class="btn btn-secondary btn-icon" href="#" download title="Download video" aria-label="Download video">${iconSvg("download")}</a>
         <a id="publish-kit-open" class="btn btn-ghost btn-icon" href="https://www.tiktok.com/upload" target="_blank" rel="noopener" title="Open TikTok" aria-label="Open TikTok">${iconSvg("external")}</a>
       </div>
@@ -939,7 +821,7 @@ function showPublishKitDrawer(data) {
   setPublishKitText("publish-kit-filename", data.filename || "");
   setPublishKitText("publish-kit-title", data.title);
   setPublishKitText("publish-kit-description", data.description);
-  setPublishKitText("publish-kit-caption", data.copy_all_text || data.caption);
+  setPublishKitText("publish-kit-post-text", data.copy_all_text || data.post_text);
   const tags = document.getElementById("publish-kit-hashtags");
   if (tags) {
     const hashtags = Array.isArray(data.hashtags) ? data.hashtags : [];
@@ -988,7 +870,7 @@ async function prepareTikTok(shortId, btn) {
     });
     let copied = false;
     try {
-      copied = await copyTextToClipboard(data.copy_all_text || data.caption || "");
+      copied = await copyTextToClipboard(data.copy_all_text || data.post_text || "");
     } catch (e) {
       copied = false;
     }
@@ -1070,10 +952,7 @@ function renderShortCard(short) {
     ? `<div class="short-title">${escHtml(short.title)}</div>`
     : "";
   const status = escHtml(short.status || "draft");
-  const shortStatus =
-    short.status === "approved" || short.status === "rejected"
-      ? ""
-      : `<span class="short-status short-status-${status}">${status}</span>`;
+  const shortStatus = `<span class="short-status short-status-${status}">${status}</span>`;
   const latestUpload = short.latest_upload || {};
   const uploadStatus = latestUpload.status
     ? `<span class="short-status short-status-${escHtml(latestUpload.status)}">${escHtml(latestUpload.status)}</span>`
@@ -1127,12 +1006,9 @@ function renderShortCard(short) {
     ? `<div class="short-reason">${escHtml(short.selection_reason)}</div>`
     : "";
 
-  const uploadButton =
-    short.status === "approved"
-      ? `<button class="btn btn-ghost btn-sm" onclick="uploadShort(${short.id}, 'youtube', this)">Upload to YouTube</button>
+  const publishButtons = `<button class="btn btn-ghost btn-sm" onclick="uploadShort(${short.id}, 'youtube', this)">Upload to YouTube</button>
          <button class="btn btn-ghost btn-sm" onclick="prepareTikTok(${short.id}, this)">Prepare for TikTok</button>
-         <button class="btn btn-ghost btn-sm" onclick="shareToSnapchat(${short.id}, this)">Share to Snapchat</button>`
-      : "";
+         <button class="btn btn-ghost btn-sm" onclick="shareToSnapchat(${short.id}, this)">Share to Snapchat</button>`;
 
   return `<div class="short-card short-card-${status}" data-short-id="${short.id}">
     <div class="short-card-top">
@@ -1150,10 +1026,7 @@ function renderShortCard(short) {
         <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 3 20 12 6 21 6 3"/></svg>
         Play
       </button>
-      <a href="/short/${short.id}/review" class="btn btn-secondary btn-sm" style="text-decoration:none">Review</a>
-      <button class="btn btn-secondary btn-sm" onclick="updateShortStatus(${short.id}, 'approved', this)">Approve</button>
-      <button class="btn btn-danger btn-sm" onclick="updateShortStatus(${short.id}, 'rejected', this)">Reject</button>
-      ${uploadButton}
+      ${publishButtons}
       <a href="/download/${encodeURIComponent(short.filename || "")}" class="btn btn-ghost btn-sm" style="text-decoration:none" download>
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
         Download

@@ -10,7 +10,7 @@ MAX_VIDEO_SECONDS = 300.0
 def build_share_payload(
     *,
     file_url: str,
-    caption: str = "",
+    post_text: str = "",
     client_id: str = "",
     duration: float | None = None,
     file_size: int | None = None,
@@ -19,16 +19,16 @@ def build_share_payload(
         raise RuntimeError("Snapchat Creative Kit videos must be 300 MB or smaller.")
     if duration is not None and duration > MAX_VIDEO_SECONDS:
         raise RuntimeError("Snapchat Creative Kit videos must be 5 minutes or shorter.")
-    caption = (caption or "")[:250]
+    post_text = (post_text or "")[:250]
     query = {
         "attachmentUrl": file_url,
-        "captionText": caption,
+        "captionText": post_text,
     }
     if client_id:
         query["clientId"] = client_id
     return {
         "share_url": f"{CREATIVE_KIT_WEB_URL}?{urlencode(query)}",
-        "caption": caption,
+        "post_text": post_text,
         "file_url": file_url,
     }
 
@@ -37,7 +37,7 @@ def build_share_for_file(
     *,
     base_url: str,
     filename: str,
-    caption: str = "",
+    post_text: str = "",
     client_id: str = "",
     duration: float | None = None,
     file_path: str | None = None,
@@ -45,7 +45,7 @@ def build_share_for_file(
     file_size = Path(file_path).stat().st_size if file_path else None
     return build_share_payload(
         file_url=f"{base_url.rstrip('/')}/outputs/{filename}",
-        caption=caption,
+        post_text=post_text,
         client_id=client_id,
         duration=duration,
         file_size=file_size,

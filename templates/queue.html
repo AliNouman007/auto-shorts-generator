@@ -49,14 +49,14 @@
   </div>
 
   <div class="queue-filters">
-    {% for item in ['all', 'youtube', 'tiktok', 'snapchat', 'approved', 'scheduled', 'ready', 'uploaded', 'failed'] %}
+    {% for item in ['all', 'youtube', 'tiktok', 'snapchat', 'scheduled', 'ready', 'uploaded', 'failed'] %}
     <a class="filter-chip {{ 'active' if status_filter == item else '' }}" href="/queue?status={{ item }}">{{ item }}</a>
     {% endfor %}
   </div>
 
   <div class="queue-list">
     {% if not queue %}
-    <div class="empty-state"><h3>No Shorts in this queue</h3><p>Approve generated Shorts to prepare them for YouTube upload.</p></div>
+    <div class="empty-state"><h3>No Shorts in this queue</h3><p>Generated Shorts appear here when they are ready to publish.</p></div>
     {% endif %}
     {% for item in queue %}
     <div class="queue-row">
@@ -65,18 +65,15 @@
         <div class="short-meta">{{ item.source_title or 'Source video' }} · {{ '%.1f'|format(item.duration or 0) }}s</div>
       </div>
       <div class="queue-statuses">
-        {% if item.short_status not in ['approved', 'rejected'] %}
         <span class="short-status short-status-{{ item.short_status }}">{{ item.short_status }}</span>
-        {% endif %}
         {% if item.platform %}<span class="score-pill">Platform {{ item.platform }}</span>{% endif %}
         {% if item.upload_status %}<span class="short-status short-status-{{ item.upload_status }}">{{ item.upload_status }}</span>{% endif %}
         {% if item.platform_status %}<span class="score-pill">{{ item.platform_status }}</span>{% endif %}
       </div>
       <div class="queue-row-actions">
-        <a class="btn btn-secondary btn-sm" href="/short/{{ item.short_id }}/review">Edit</a>
         {% if item.upload_status == 'failed' and item.upload_id and item.platform == 'youtube' %}
         <button class="btn btn-ghost btn-sm" onclick="retryUpload({{ item.upload_id }}, this)">Retry</button>
-        {% elif item.short_status == 'approved' %}
+        {% else %}
         <button class="btn btn-primary btn-sm" onclick="uploadShort({{ item.short_id }}, 'youtube', this)">Upload to YouTube</button>
         <button class="btn btn-secondary btn-sm" onclick="prepareTikTok({{ item.short_id }}, this)">Prepare for TikTok</button>
         <button class="btn btn-ghost btn-sm" onclick="shareToSnapchat({{ item.short_id }}, this)">Share to Snapchat</button>
