@@ -4,7 +4,10 @@ from unittest import mock
 from starlette.requests import Request
 
 import main
-from services.overlays import series_badge
+from services import presets
+from services.comedy_v3 import model_router as comedy_v3_model_router
+from services.comedy_v3 import pipeline as comedy_v3_pipeline
+from services.comedy_v3 import selector as comedy_v3_selector
 
 
 class ExportFilterTest(unittest.TestCase):
@@ -17,17 +20,17 @@ class ExportFilterTest(unittest.TestCase):
         self.assertIn("overlay=(W-w)/2:(H-h)/2", vf)
         self.assertNotIn("subtitles=", vf)
 
-    def test_export_filter_adds_top_series_badge_when_configured(self):
+    def test_export_filter_ignores_removed_top_series_badge_config(self):
         vf = main.build_export_video_filter(preset={
             "series_badge_enabled": True,
             "series_badge_label": "Funniest Moment",
             "series_badge_text": "India's Got Latent EP1 - Part 10/28",
         })
 
-        self.assertIn("drawbox=", vf)
-        self.assertIn("drawtext=", vf)
-        self.assertIn("Funniest Moment", vf)
-        self.assertIn("India\\'s Got Latent EP1 - Part 10/28", vf)
+        self.assertNotIn("drawbox=", vf)
+        self.assertNotIn("drawtext=", vf)
+        self.assertNotIn("Funniest Moment", vf)
+        self.assertNotIn("India\\'s Got Latent EP1 - Part 10/28", vf)
 
     def test_export_short_clip_uses_faster_x264_settings(self):
         with mock.patch.object(main, "run_command") as run_command:
@@ -46,20 +49,6 @@ class ExportFilterTest(unittest.TestCase):
         self.assertIn("libx264", command)
         self.assertEqual("veryfast", command[command.index("-preset") + 1])
         self.assertEqual("24", command[command.index("-crf") + 1])
-
-
-class SeriesBadgeTest(unittest.TestCase):
-    def test_series_badge_uses_short_label_and_part_count(self):
-        badge = series_badge.build_series_badge(
-            "India's Got Latent EP1 full episode with judges",
-            part_number=10,
-            total_parts=28,
-            label="Funniest Moment",
-        )
-
-        self.assertTrue(badge["series_badge_enabled"])
-        self.assertEqual("Funniest Moment", badge["series_badge_label"])
-        self.assertEqual("India's Got Latent EP1 full episode - Part 10/28", badge["series_badge_text"])
 
 
 class YoutubeDownloadCommandTest(unittest.TestCase):
@@ -91,6 +80,70 @@ class YoutubeDownloadCommandTest(unittest.TestCase):
 
 
 class ProcessingPipelineTest(unittest.TestCase):
+    def test_extract_audio_scales_timeout_for_long_sources(self):
+        with mock.patch.object(main, "run_command") as run_command:
+            run_command.return_value.returncode = 0
+
+            extracted = main.extract_audio(
+                "long-source.mp4",
+                "long-source-audio.mp3",
+                source_duration=6148,
+            )
+
+        self.assertTrue(extracted)
+        self.assertGreater(run_command.call_args.kwargs["timeout"], 300)
+
+    def test_deepgram_transcription_requires_api_key(self):
+        with mock.patch.object(main, "DEEPGRAM_API_KEY", ""):
+            with self.assertRaisesRegex(RuntimeError, "DEEPGRAM_API_KEY"):
+                main.transcribe_audio_for_clip_selection("audio.mp3")
+
+    def test_deepgram_transcription_maps_words_and_utterances_to_segments(self):
+        payload = {
+            "results": {
+                "channels": [{
+                    "alternatives": [{
+                        "transcript": "Deepgram selects useful shorts.",
+                        "words": [
+                            {"word": "Deepgram", "start": 0.0, "end": 0.5},
+                            {"punctuated_word": "selects", "start": 0.5, "end": 0.9},
+                            {"word": "useful", "start": 0.9, "end": 1.2},
+                            {"punctuated_word": "shorts.", "start": 1.2, "end": 1.7},
+                        ],
+                    }],
+                }],
+                "utterances": [{
+                    "start": 0.0,
+                    "end": 1.7,
+                    "transcript": "Deepgram selects useful shorts.",
+                    "words": [
+                        {"word": "Deepgram", "start": 0.0, "end": 0.5},
+                        {"punctuated_word": "selects", "start": 0.5, "end": 0.9},
+                    ],
+                }],
+            },
+        }
+        response = mock.Mock(status_code=200)
+        response.json.return_value = payload
+
+        with (
+            mock.patch.object(main, "DEEPGRAM_API_KEY", "dg-key"),
+            mock.patch("main.Path") as path_cls,
+            mock.patch("main.httpx.Client") as client_cls,
+        ):
+            path = mock.Mock()
+            path.name = "audio.mp3"
+            path.open = mock.mock_open(read_data=b"audio")
+            path_cls.return_value = path
+            client_cls.return_value.__enter__.return_value.post.return_value = response
+
+            transcript = main.transcribe_audio_for_clip_selection("audio.mp3")
+
+        self.assertEqual("deepgram", transcript["provider"])
+        self.assertEqual("nova-2", transcript["model"])
+        self.assertEqual("Deepgram selects useful shorts.", transcript["segments"][0]["text"])
+        self.assertEqual("Deepgram", transcript["segments"][0]["words"][0]["word"])
+
     def test_processing_uses_transcript_selection_and_exports_all_clips(self):
         source_path = main.UPLOADS_DIR / "unit_core_processing.mp4"
         source_path.write_text("source")
@@ -132,7 +185,7 @@ class ProcessingPipelineTest(unittest.TestCase):
                 "selection_reason": "Strong second moment.",
             },
         ]
-        transcript = {"provider": "local-whisper", "segments": segments, "words": []}
+        transcript = {"provider": "deepgram", "segments": segments, "words": []}
 
         with (
             mock.patch.object(main, "missing_tools_message", return_value=""),
@@ -148,6 +201,202 @@ class ProcessingPipelineTest(unittest.TestCase):
         self.assertEqual(segments, select_clips.call_args.args[0])
         self.assertEqual(2, export_short_clip.call_count)
         self.assertEqual(2, main.db_read("SELECT COUNT(*) AS count FROM shorts WHERE video_id=?", (video_id,))[0]["count"])
+
+    def test_preset_defaults_to_comedy_v3_with_gemini_balanced(self):
+        config = presets.normalize_preset_config({})
+
+        self.assertEqual("comedy_v3", config["clip_engine"])
+        self.assertEqual("gemini", config["comedy_v3_main_brain"])
+        self.assertEqual("balanced", config["comedy_v3_quality_mode"])
+
+    def test_select_clips_uses_v2_only_when_selected(self):
+        segments = [{"start": 0, "end": 35, "text": "A complete funny setup and payoff."}]
+
+        with (
+            mock.patch.object(main.clip_selection, "select_dynamic_clips", return_value=[{"start": 0, "end": 35}]) as v2,
+            mock.patch.object(main.comedy_v3_pipeline, "select_comedy_clips", return_value=[{"start": 1, "end": 30}]) as v3,
+        ):
+            clips = main.select_clips_for_video(
+                segments,
+                duration=300,
+                ai_model="gemini",
+                preset={"clip_engine": "v2"},
+            )
+
+        self.assertEqual([{"start": 0, "end": 35}], clips)
+        v2.assert_called_once()
+        v3.assert_not_called()
+
+    def test_select_clips_uses_comedy_v3_only_when_selected(self):
+        segments = [{"start": 0, "end": 35, "text": "A complete funny setup and payoff."}]
+
+        with (
+            mock.patch.object(main.clip_selection, "select_dynamic_clips", return_value=[{"start": 0, "end": 35}]) as v2,
+            mock.patch.object(main.comedy_v3_pipeline, "select_comedy_clips", return_value=[{"start": 1, "end": 30}]) as v3,
+        ):
+            clips = main.select_clips_for_video(
+                segments,
+                duration=300,
+                ai_model="groq",
+                preset={
+                    "clip_engine": "comedy_v3",
+                    "comedy_v3_main_brain": "groq",
+                    "comedy_v3_quality_mode": "balanced",
+                },
+            )
+
+        self.assertEqual([{"start": 1, "end": 30}], clips)
+        v3.assert_called_once()
+        v2.assert_not_called()
+
+    def test_comedy_v3_empty_result_does_not_fallback_to_v2(self):
+        segments = [{"start": 0, "end": 35, "text": "Weak comedy filler."}]
+
+        with (
+            mock.patch.object(main.clip_selection, "select_dynamic_clips", return_value=[{"start": 0, "end": 35}]) as v2,
+            mock.patch.object(main.comedy_v3_pipeline, "select_comedy_clips", return_value=[]) as v3,
+        ):
+            clips = main.select_clips_for_video(
+                segments,
+                duration=300,
+                ai_model="gemini",
+                preset={"clip_engine": "comedy_v3"},
+            )
+
+        self.assertEqual([], clips)
+        v3.assert_called_once()
+        v2.assert_not_called()
+
+    def test_ui_exposes_comedy_v3_engine_brain_and_quality_controls(self):
+        template = (main.TEMPLATES_DIR / "index.html").read_text()
+        script = (main.STATIC_DIR / "app.js").read_text()
+
+        self.assertIn('id="preset-clip-engine"', template)
+        self.assertIn('value="comedy_v3"', template)
+        self.assertIn('id="preset-comedy-brain"', template)
+        self.assertIn('value="gemini"', template)
+        self.assertIn('value="groq"', template)
+        self.assertIn('id="preset-comedy-quality"', template)
+        self.assertIn("clip_engine", script)
+        self.assertIn("comedy_v3_main_brain", script)
+        self.assertIn("comedy_v3_quality_mode", script)
+
+    def test_comedy_v3_requires_selected_gemini_key(self):
+        with self.assertRaisesRegex(RuntimeError, "GEMINI_API_KEY"):
+            comedy_v3_pipeline.select_comedy_clips(
+                [{"start": 0, "end": 20, "text": "Funny setup and payoff."}],
+                duration=120,
+                model_config={
+                    "brain": "gemini",
+                    "gemini_api_key": "",
+                    "groq_api_key": "groq-key",
+                },
+            )
+
+    def test_comedy_v3_requires_selected_groq_key(self):
+        with self.assertRaisesRegex(RuntimeError, "GROQ_API_KEY"):
+            comedy_v3_pipeline.select_comedy_clips(
+                [{"start": 0, "end": 20, "text": "Funny setup and payoff."}],
+                duration=120,
+                model_config={
+                    "brain": "groq",
+                    "gemini_api_key": "gemini-key",
+                    "groq_api_key": "",
+                },
+            )
+
+    def test_groq_rate_limit_error_is_actionable(self):
+        response = mock.Mock(status_code=429)
+        response.text = '{"error":{"message":"rate limit exceeded"}}'
+        response.json.return_value = {"error": {"message": "rate limit exceeded"}}
+
+        with mock.patch("services.comedy_v3.model_router.httpx.Client") as client_cls:
+            client_cls.return_value.__enter__.return_value.post.return_value = response
+            with self.assertRaisesRegex(RuntimeError, "rate-limited.*select Gemini"):
+                comedy_v3_model_router.complete_json(
+                    "prompt",
+                    "groq",
+                    30,
+                    groq_api_key="groq-key",
+                    groq_model="llama",
+                )
+
+    def test_balanced_selector_keeps_a_tier_and_strong_b_tier_only(self):
+        clips = comedy_v3_selector.select_final_clips([
+            {"candidate_id": "a", "start": 0, "end": 60, "quality_tier": "A", "worthiness_score": 0.91, "standalone_score": 0.8, "context_score": 0.8, "boundary_confidence": 0.8},
+            {"candidate_id": "b", "start": 80, "end": 140, "quality_tier": "B", "worthiness_score": 0.76, "standalone_score": 0.75, "context_score": 0.75, "boundary_confidence": 0.75},
+            {"candidate_id": "c", "start": 160, "end": 220, "quality_tier": "B", "worthiness_score": 0.45, "standalone_score": 0.4, "context_score": 0.4, "boundary_confidence": 0.8},
+            {"candidate_id": "d", "start": 240, "end": 300, "quality_tier": "C", "worthiness_score": 0.9, "standalone_score": 0.9, "context_score": 0.9, "boundary_confidence": 0.9},
+        ], quality_mode="balanced")
+
+        self.assertEqual(["a", "b"], [clip["candidate_id"] for clip in clips])
+
+    def test_comedy_v3_boundary_expander_includes_setup_punchline_and_reaction(self):
+        segments = [
+            {"start": 100, "end": 110, "text": "The host explains why everyone is teasing Raj."},
+            {"start": 110, "end": 122, "text": "Raj says he is very confident today."},
+            {"start": 122, "end": 130, "text": "The judge replies with a savage joke."},
+            {"start": 130, "end": 138, "text": "Everyone laughs and Raj reacts."},
+        ]
+        expanded = comedy_v3_pipeline.expand_candidate_boundary(
+            {
+                "candidate_id": "c1",
+                "scene_id": "scene_001",
+                "rough_start": 122,
+                "rough_end": 130,
+                "moment_type": "savage_reply",
+            },
+            segments,
+            max_duration=180,
+        )
+
+        self.assertEqual(100, expanded["start"])
+        self.assertEqual(138, expanded["end"])
+        self.assertGreaterEqual(expanded["boundary_confidence"], 0.7)
+
+    def test_comedy_v3_dedupes_to_more_complete_joke(self):
+        clips = comedy_v3_selector.select_final_clips([
+            {"candidate_id": "short", "start": 120, "end": 150, "quality_tier": "A", "worthiness_score": 0.8, "standalone_score": 0.6, "context_score": 0.5, "boundary_confidence": 0.6},
+            {"candidate_id": "complete", "start": 100, "end": 155, "quality_tier": "A", "worthiness_score": 0.82, "standalone_score": 0.9, "context_score": 0.9, "boundary_confidence": 0.9},
+        ], quality_mode="balanced")
+
+        self.assertEqual(["complete"], [clip["candidate_id"] for clip in clips])
+
+    def test_clip_selection_error_marks_score_step_error(self):
+        source_path = main.UPLOADS_DIR / "unit_selection_failure.mp4"
+        source_path.write_text("source")
+        main.db_write(
+            "INSERT INTO videos (youtube_video_id, title, source_path, status) VALUES (?,?,?,'waiting')",
+            ("unit_selection_failure", "Selection failure", str(source_path)),
+        )
+        video_id = main.db_read(
+            "SELECT id FROM videos WHERE youtube_video_id=?",
+            ("unit_selection_failure",),
+        )[0]["id"]
+        self.addCleanup(lambda: main.db_write("DELETE FROM shorts WHERE video_id=?", (video_id,)))
+        self.addCleanup(lambda: main.db_write("DELETE FROM videos WHERE id=?", (video_id,)))
+        self.addCleanup(lambda: source_path.unlink(missing_ok=True))
+
+        transcript = {
+            "provider": "deepgram",
+            "segments": [{"start": 0, "end": 20, "text": "Funny setup and payoff."}],
+            "words": [],
+        }
+
+        with (
+            mock.patch.object(main, "missing_tools_message", return_value=""),
+            mock.patch.object(main, "is_valid_video", return_value=True),
+            mock.patch.object(main, "get_video_duration", return_value=300),
+            mock.patch.object(main, "extract_audio", return_value=True),
+            mock.patch.object(main, "transcribe_audio_for_clip_selection", return_value=transcript),
+            mock.patch.object(main, "select_clips_for_video", side_effect=RuntimeError("Groq Comedy V3 was rate-limited.")),
+        ):
+            main._process_video_sync(video_id, str(source_path))
+
+        row = main.db_read("SELECT status,error_message,steps_json FROM videos WHERE id=?", (video_id,))[0]
+        self.assertEqual("failed", row["status"])
+        self.assertIn("rate-limited", row["error_message"])
+        self.assertIn('"name": "Score & select highlights", "status": "error"', row["steps_json"])
 
 
 class VideoActionsTest(unittest.TestCase):

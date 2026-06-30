@@ -12,12 +12,11 @@ DEFAULT_PRESET_CONFIG = {
     "hard_max_clip_duration": 180,
     "allow_three_minute_shorts": False,
     "director_mode": "balanced",
+    "clip_engine": "comedy_v3",
+    "comedy_v3_main_brain": "gemini",
+    "comedy_v3_quality_mode": "balanced",
     "clip_output_mode": "shorts",
     "genre_hint": "",
-    "series_badge_enabled": True,
-    "series_badge_label": "Funniest Moment",
-    "series_badge_font_size": 38,
-    "series_badge_part_font_size": 30,
 }
 
 ENCODER_PRESETS = {
@@ -79,24 +78,13 @@ def normalize_preset_config(config=None):
     normalized["encoder_preset"] = encoder_preset if encoder_preset in ENCODER_PRESETS else "veryfast"
     director_mode = str(normalized.get("director_mode") or "balanced").lower()
     normalized["director_mode"] = director_mode if director_mode in {"balanced", "snappy", "story", "deep"} else "balanced"
+    clip_engine = str(normalized.get("clip_engine") or "comedy_v3").lower()
+    normalized["clip_engine"] = clip_engine if clip_engine in {"v2", "comedy_v3"} else "comedy_v3"
+    comedy_brain = str(normalized.get("comedy_v3_main_brain") or "gemini").lower()
+    normalized["comedy_v3_main_brain"] = comedy_brain if comedy_brain in {"gemini", "groq"} else "gemini"
+    comedy_quality = str(normalized.get("comedy_v3_quality_mode") or "balanced").lower()
+    normalized["comedy_v3_quality_mode"] = comedy_quality if comedy_quality in {"strict", "balanced", "volume"} else "balanced"
     clip_output_mode = str(normalized.get("clip_output_mode") or "shorts").lower()
     normalized["clip_output_mode"] = clip_output_mode if clip_output_mode in {"shorts", "highlights"} else "shorts"
     normalized["genre_hint"] = str(normalized.get("genre_hint") or "").strip()[:120]
-    normalized["series_badge_enabled"] = normalized.get("series_badge_enabled") is not False
-    normalized["series_badge_label"] = str(
-        normalized.get("series_badge_label") or DEFAULT_PRESET_CONFIG["series_badge_label"]
-    ).strip()[:32]
-    normalized["series_badge_text"] = str(normalized.get("series_badge_text") or "").strip()[:80]
-    normalized["series_badge_font_size"] = _coerce_int(
-        normalized.get("series_badge_font_size"),
-        DEFAULT_PRESET_CONFIG["series_badge_font_size"],
-        18,
-        72,
-    )
-    normalized["series_badge_part_font_size"] = _coerce_int(
-        normalized.get("series_badge_part_font_size"),
-        DEFAULT_PRESET_CONFIG["series_badge_part_font_size"],
-        14,
-        60,
-    )
     return normalized

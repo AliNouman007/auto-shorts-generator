@@ -96,11 +96,6 @@ async function saveDefaultPreset(btn) {
     .split("x")
     .map((value) => parseInt(value, 10));
   const config = {
-    series_badge_enabled:
-      document.getElementById("preset-series-badge-enabled")?.checked !== false,
-    series_badge_label:
-      document.getElementById("preset-series-badge-label")?.value ||
-      "Funniest Moment",
     width: Number.isFinite(width) ? width : 1080,
     height: Number.isFinite(height) ? height : 1920,
     encoder_preset:
@@ -110,6 +105,12 @@ async function saveDefaultPreset(btn) {
       document.getElementById("preset-blur")?.value || "30",
       10,
     ),
+    clip_engine:
+      document.getElementById("preset-clip-engine")?.value || "comedy_v3",
+    comedy_v3_main_brain:
+      document.getElementById("preset-comedy-brain")?.value || "gemini",
+    comedy_v3_quality_mode:
+      document.getElementById("preset-comedy-quality")?.value || "balanced",
     clip_output_mode:
       document.getElementById("preset-clip-output-mode")?.value || "shorts",
     genre_hint: document.getElementById("preset-genre-hint")?.value || "",
@@ -243,9 +244,9 @@ async function connectYouTube() {
 
 async function setModel(model) {
   const modelLabels = {
-    openai: "OpenAI Whisper",
-    gemini: "Gemini Flash",
-    groq: "Groq Whisper",
+    openai: "OpenAI",
+    gemini: "Gemini",
+    groq: "Groq",
   };
 
   try {
@@ -650,29 +651,6 @@ function escJsString(s) {
   return String(s).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
 }
 
-async function uploadShortYoutubeLegacy(shortId, btn) {
-  const done = setButtonBusy(btn, "Uploading…");
-  try {
-    const data = await fetchJson(`/short/${shortId}/upload`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ platform: "youtube", privacy_status: "private" }),
-    });
-    if (data.upload?.status === "uploaded") {
-      showToast("Short uploaded to YouTube as private.", "success");
-    } else {
-      showToast(
-        data.upload?.error_message || "YouTube upload failed.",
-        "error",
-      );
-    }
-    reloadSoon(900);
-  } catch (e) {
-    showToast(e.message || "Could not upload Short", "error");
-    done();
-  }
-}
-
 async function uploadShort(shortId, platformOrBtn = "youtube", maybeBtn = null) {
   const platform = typeof platformOrBtn === "string" ? platformOrBtn : "youtube";
   const btn = typeof platformOrBtn === "string" ? maybeBtn : platformOrBtn;
@@ -695,22 +673,6 @@ async function uploadShort(shortId, platformOrBtn = "youtube", maybeBtn = null) 
     } else {
       showToast(data.upload?.error_message || `${platform} upload failed.`, "error");
     }
-    reloadSoon(900);
-  } catch (e) {
-    showToast(e.message || "Could not upload Short", "error");
-    done();
-  }
-}
-
-async function uploadShortToAll(shortId, btn) {
-  const done = setButtonBusy(btn, "Uploading...");
-  try {
-    await fetchJson(`/short/${shortId}/upload-all`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ platforms: ["youtube"] }),
-    });
-    showToast("YouTube upload started.", "success");
     reloadSoon(900);
   } catch (e) {
     showToast(e.message || "Could not upload Short", "error");

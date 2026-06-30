@@ -50,8 +50,8 @@ class CaptionReviewRemovalTest(unittest.TestCase):
             "selection_reason": "Transcript still drives clip selection.",
         }
         transcript = {
-            "provider": "local-whisper",
-            "model": "whisper-cli",
+            "provider": "deepgram",
+            "model": "nova-2",
             "segments": [segment],
             "words": [],
         }
@@ -123,6 +123,8 @@ class CaptionReviewRemovalTest(unittest.TestCase):
 
         self.assertNotIn("captions-toggle", html)
         self.assertNotIn(">Captions<", html)
+        self.assertNotIn("Top Part Badge", html)
+        self.assertNotIn("Badge Label", html)
         self.assertNotIn(">Review<", html)
         self.assertNotIn(">Approve<", html)
         self.assertNotIn(">Reject<", html)

@@ -26,6 +26,11 @@
       {% else %}
         <span class="pill warn"><span class="dot"></span>API Missing</span>
       {% endif %}
+      {% if has_deepgram_key %}
+        <span class="pill ok"><span class="dot"></span>Deepgram Ready</span>
+      {% else %}
+        <span class="pill error"><span class="dot"></span>Deepgram Missing</span>
+      {% endif %}
       <span class="pill {% if youtube_connected %}ok{% elif has_youtube_oauth %}warn{% else %}error{% endif %}" data-yt-status="true">
         <span class="dot"></span>
         {% if youtube_connected %}
@@ -87,23 +92,23 @@
         </div>
 
         <div class="settings-field">
-          <label class="field-label">AI Transcription Model</label>
+          <label class="field-label">V2 AI Director Model</label>
           <div class="model-toggle">
             <button class="model-btn {% if ai_model == 'openai' %}active{% endif %}" id="btn-openai" onclick="setModel('openai')">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M22.282 9.821a5.985 5.985 0 0 0-.516-4.91 6.046 6.046 0 0 0-6.51-2.9A6.065 6.065 0 0 0 4.981 4.18a5.985 5.985 0 0 0-3.998 2.9 6.046 6.046 0 0 0 .743 7.097 5.98 5.98 0 0 0 .51 4.911 6.051 6.051 0 0 0 6.515 2.9A5.985 5.985 0 0 0 13.26 24a6.056 6.056 0 0 0 5.772-4.206 5.99 5.99 0 0 0 3.997-2.9 6.056 6.056 0 0 0-.747-7.073z"/></svg>
-              OpenAI Whisper
+              OpenAI
             </button>
             <button class="model-btn {% if ai_model == 'gemini' %}active{% endif %}" id="btn-gemini" onclick="setModel('gemini')">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
-              Gemini Flash
+              Gemini
             </button>
             <button class="model-btn {% if ai_model == 'groq' %}active{% endif %}" id="btn-groq" onclick="setModel('groq')">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 12a8 8 0 1 1 8 8"/><path d="M4 12h8v8"/></svg>
-              Groq Whisper
+              Groq
             </button>
           </div>
           <div class="field-hint">
-            OpenAI and Groq use Whisper APIs. Gemini uses your GEMINI_API_KEY. Local Whisper CLI tried first.
+            Deepgram creates transcript timestamps. This setting is used by the V2 engine; Comedy V3 uses the main brain selected in the output preset.
           </div>
         </div>
       </div>
@@ -144,14 +149,6 @@
           <span class="channel-id-badge">{{ output_preset.name if output_preset else 'Default' }}</span>
         </div>
         <div class="preset-grid">
-          <label class="settings-field checkbox-field">
-            <span class="field-label">Top Part Badge</span>
-            <input id="preset-series-badge-enabled" type="checkbox" {% if output_config.series_badge_enabled is not defined or output_config.series_badge_enabled %}checked{% endif %} />
-          </label>
-          <label class="settings-field">
-            <span class="field-label">Badge Label</span>
-            <input id="preset-series-badge-label" class="field-input" type="text" maxlength="32" value="{{ output_config.series_badge_label | default('Funniest Moment') }}" />
-          </label>
           <label class="settings-field">
             <span class="field-label">Resolution</span>
             <select id="preset-resolution" class="field-input">
@@ -174,6 +171,28 @@
           <label class="settings-field">
             <span class="field-label">Blur Strength</span>
             <input id="preset-blur" class="field-input" type="number" min="0" max="80" value="{{ output_config.blur_strength | default(30) }}" />
+          </label>
+          <label class="settings-field">
+            <span class="field-label">Clip Engine</span>
+            <select id="preset-clip-engine" class="field-input">
+              <option value="comedy_v3" {% if (output_config.clip_engine | default('comedy_v3')) == 'comedy_v3' %}selected{% endif %}>Comedy V3 Engine</option>
+              <option value="v2" {% if output_config.clip_engine == 'v2' %}selected{% endif %}>V2 Generic Engine</option>
+            </select>
+          </label>
+          <label class="settings-field">
+            <span class="field-label">Comedy Main Brain</span>
+            <select id="preset-comedy-brain" class="field-input">
+              <option value="gemini" {% if (output_config.comedy_v3_main_brain | default('gemini')) == 'gemini' %}selected{% endif %}>Gemini</option>
+              <option value="groq" {% if output_config.comedy_v3_main_brain == 'groq' %}selected{% endif %}>Groq</option>
+            </select>
+          </label>
+          <label class="settings-field">
+            <span class="field-label">Comedy Quality Mode</span>
+            <select id="preset-comedy-quality" class="field-input">
+              <option value="strict" {% if output_config.comedy_v3_quality_mode == 'strict' %}selected{% endif %}>Strict</option>
+              <option value="balanced" {% if (output_config.comedy_v3_quality_mode | default('balanced')) == 'balanced' %}selected{% endif %}>Balanced</option>
+              <option value="volume" {% if output_config.comedy_v3_quality_mode == 'volume' %}selected{% endif %}>Volume</option>
+            </select>
           </label>
           <label class="settings-field">
             <span class="field-label">Clip Output</span>

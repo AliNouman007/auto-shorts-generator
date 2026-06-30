@@ -6,7 +6,6 @@ Monitors YouTube channels for new uploads and generates short-form vertical clip
 import os
 import re
 import json
-import base64
 import hmac
 import hashlib
 import asyncio
@@ -26,9 +25,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from services import exporting, presets, shorts_director, youtube_upload
+from services.comedy_v3 import pipeline as comedy_v3_pipeline
 from services.clip_director import selection as clip_selection
 from services.clip_director.llm import request_llm_episode_profile, request_llm_selection
-from services.overlays import series_badge
 from services.publishing.kit import build_publish_kit
 from services.uploads import snapchat as snapchat_upload
 
@@ -88,8 +87,9 @@ OPENAI_API_KEY = env_value("OPENAI_API_KEY")
 OPENAI_LLM_MODEL = env_value("OPENAI_LLM_MODEL", "gpt-4o-mini")
 GEMINI_API_KEY = env_value("GEMINI_API_KEY")
 GEMINI_MODEL = env_value("GEMINI_MODEL", "gemini-2.0-flash")
+DEEPGRAM_API_KEY = env_value("DEEPGRAM_API_KEY")
+DEEPGRAM_MODEL = env_value("DEEPGRAM_MODEL", "nova-2")
 GROQ_API_KEY = env_value("GROQ_API_KEY")
-GROQ_MODEL = env_value("GROQ_MODEL", "whisper-large-v3-turbo")
 GROQ_LLM_MODEL = env_value("GROQ_LLM_MODEL", "llama-3.1-8b-instant")
 SNAPCHAT_CLIENT_ID = env_value("SNAPCHAT_CLIENT_ID")
 WEBHOOK_SECRET = env_value("WEBHOOK_SECRET")
@@ -98,8 +98,6 @@ PORT = env_int("PORT", 8000)
 YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
 
 REQUIRED_VIDEO_TOOLS = ("ffmpeg", "ffprobe")
-TRANSCRIPTION_LANGUAGE_HINT = env_value("TRANSCRIPTION_LANGUAGE_HINT", "hi").lower()
-
 
 def command_available(command: str) -> bool:
     return shutil.which(command) is not None
@@ -277,12 +275,6 @@ def init_db():
         "ALTER TABLE shorts ADD COLUMN final_score REAL",
         "ALTER TABLE shorts ADD COLUMN score_details_json TEXT",
         "ALTER TABLE shorts ADD COLUMN judge_status TEXT",
-        "ALTER TABLE shorts ADD COLUMN series_title TEXT",
-        "ALTER TABLE shorts ADD COLUMN series_part_number INTEGER",
-        "ALTER TABLE shorts ADD COLUMN series_total_parts INTEGER",
-        "ALTER TABLE shorts ADD COLUMN series_badge_label TEXT",
-        "ALTER TABLE shorts ADD COLUMN series_badge_text TEXT",
-        "ALTER TABLE shorts ADD COLUMN series_badge_enabled INTEGER DEFAULT 1",
         "ALTER TABLE platform_accounts ADD COLUMN platform_user_id TEXT",
         "ALTER TABLE platform_accounts ADD COLUMN scopes TEXT",
         "ALTER TABLE platform_accounts ADD COLUMN refresh_expires_at TEXT",
@@ -604,24 +596,12 @@ UPLOAD_STATUSES = {"draft", "scheduled", "uploading", "processing", "uploaded", 
 UPLOAD_PLATFORMS = {"youtube", "tiktok", "snapchat"}
 
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
-
 def parse_json_object(value: str, fallback: Optional[dict] = None) -> dict:
     try:
         parsed = json.loads(value or "{}")
     except Exception:
         return fallback or {}
     return parsed if isinstance(parsed, dict) else (fallback or {})
-
-
-def parse_json_array(value: str, fallback: Optional[list] = None) -> list:
-    try:
-        parsed = json.loads(value or "[]")
-    except Exception:
-        return fallback or []
-    return parsed if isinstance(parsed, list) else (fallback or [])
 
 
 def get_default_preset() -> dict:
@@ -725,11 +705,8 @@ def update_short_metadata(short_id: int, data: dict) -> dict:
         "upload_title",
         "upload_description",
         "scheduled_at",
-        "series_title",
-        "series_badge_label",
-        "series_badge_text",
     }
-    int_fields = {"series_part_number", "series_total_parts"}
+    int_fields = set()
     updates = []
     params = []
     for key in text_fields:
@@ -744,11 +721,6 @@ def update_short_metadata(short_id: int, data: dict) -> dict:
                 value = 0
             updates.append(f"{key}=?")
             params.append(value)
-    if "series_badge_enabled" in data:
-        value = data.get("series_badge_enabled")
-        enabled = value is True or str(value).lower() in {"1", "true", "yes", "on"}
-        updates.append("series_badge_enabled=?")
-        params.append(1 if enabled else 0)
     if "title" in data and "upload_title" not in data:
         updates.append("upload_title=?")
         params.append(str(data.get("title") or ""))
@@ -762,22 +734,6 @@ def update_short_metadata(short_id: int, data: dict) -> dict:
     db_write(
         f"UPDATE shorts SET {', '.join(updates)} WHERE id=?", tuple(params))
     return get_short_detail(short_id)
-
-
-def series_badge_config_for_short(short: dict, base_config: Optional[dict] = None) -> dict:
-    config = preset_config_for_export(base_config)
-    badge_text = str(short.get("series_badge_text") or "").strip()
-    if not badge_text:
-        config["series_badge_text"] = ""
-        return config
-    enabled_value = short.get("series_badge_enabled")
-    enabled = enabled_value is None or str(enabled_value).lower() not in {"0", "false", "no", "off"}
-    config.update({
-        "series_badge_enabled": enabled,
-        "series_badge_label": str(short.get("series_badge_label") or config.get("series_badge_label") or "Funniest Moment")[:32],
-        "series_badge_text": badge_text[:80],
-    })
-    return config
 
 
 def update_short_timing(short_id: int, start_time: float, end_time: float) -> dict:
@@ -803,7 +759,7 @@ def regenerate_short(short_id: int, preset_config: Optional[dict] = None) -> dic
     if end <= start:
         raise ValueError("Short timing is invalid.")
     duration = end - start
-    config = series_badge_config_for_short(short, preset_config)
+    config = preset_config_for_export(preset_config)
     filename = Path(short.get("filename") or f"short_{short_id}.mp4").name
     output_path = OUTPUTS_DIR / filename
     if not export_short_clip(source_path, str(output_path), start, duration, None, preset=config):
@@ -849,26 +805,6 @@ def get_youtube_account() -> Optional[dict]:
         "SELECT * FROM platform_accounts WHERE platform='youtube' ORDER BY updated_at DESC, id DESC LIMIT 1"
     )
     return rows[0] if rows else None
-
-
-def get_platform_account(platform: str) -> Optional[dict]:
-    if platform not in UPLOAD_PLATFORMS:
-        return None
-    rows = db_read(
-        "SELECT * FROM platform_accounts WHERE platform=? ORDER BY updated_at DESC, id DESC LIMIT 1",
-        (platform,),
-    )
-    return rows[0] if rows else None
-
-
-def _expires_at_from_seconds(seconds: object) -> str:
-    try:
-        delta = int(seconds or 0)
-    except (TypeError, ValueError):
-        delta = 0
-    if delta <= 0:
-        delta = 86400
-    return (datetime.now(timezone.utc) + timedelta(seconds=delta)).replace(microsecond=0).isoformat()
 
 
 def is_youtube_token_expired() -> bool:
@@ -1526,14 +1462,25 @@ def export_short_clip(
         return False
 
 
-def extract_audio(video_path: str, audio_path: str, video_id: Optional[int] = None) -> bool:
+def audio_extraction_timeout(source_duration: Optional[float]) -> int:
+    if not source_duration or source_duration <= 0:
+        return 300
+    return max(300, min(7200, int(source_duration * 0.5)))
+
+
+def extract_audio(
+    video_path: str,
+    audio_path: str,
+    video_id: Optional[int] = None,
+    source_duration: Optional[float] = None,
+) -> bool:
     """Extract mono 16 kHz audio from a video."""
     cmd = [
         "ffmpeg", "-y", "-i", video_path,
         "-vn", "-ar", "16000", "-ac", "1", "-q:a", "0", audio_path,
     ]
     try:
-        result = run_command(cmd, timeout=300, video_id=video_id)
+        result = run_command(cmd, timeout=audio_extraction_timeout(source_duration), video_id=video_id)
         return result.returncode == 0
     except CancelledProcessing:
         raise
@@ -1545,42 +1492,15 @@ def extract_audio(video_path: str, audio_path: str, video_id: Optional[int] = No
 # ---------------------------------------------------------------------------
 
 
-def build_whisper_transcription_data(model: str) -> dict:
-    data = {
-        "model": model,
-        "response_format": "verbose_json",
-        "timestamp_granularities[]": ["word", "segment"],
-    }
-    if TRANSCRIPTION_LANGUAGE_HINT:
-        data["language"] = TRANSCRIPTION_LANGUAGE_HINT
-    return data
-
-
-INSTRUCTION_LEAK_PHRASES = (
-    "do not translate",
-    "roman hinglish",
-    "format your response",
-    "output only the json",
-    "transcribe this audio",
-    "timestamp granularities",
-    "preserve the speaker",
-)
-
-
-def is_transcription_instruction_leak(text: str) -> bool:
-    lowered = str(text or "").strip().lower()
-    return bool(lowered and any(phrase in lowered for phrase in INSTRUCTION_LEAK_PHRASES))
-
-
-def _clean_transcription_words(words: list[dict] | None, offset_seconds: float = 0.0) -> list[dict]:
+def _clean_transcription_words(words: list[dict] | None) -> list[dict]:
     cleaned = []
     for word in words or []:
         try:
-            start = float(word.get("start", 0)) + offset_seconds
-            end = float(word.get("end", start)) + offset_seconds
+            start = float(word.get("start", 0))
+            end = float(word.get("end", start))
         except (TypeError, ValueError):
             continue
-        text = str(word.get("word") or word.get("text") or "").strip()
+        text = str(word.get("punctuated_word") or word.get("word") or word.get("text") or "").strip()
         if not text:
             continue
         cleaned.append({"start": start, "end": max(start, end), "word": text})
@@ -1604,7 +1524,7 @@ def _segments_from_words(words: list[dict]) -> list[dict]:
             duration = float(current[-1]["end"]) - float(current[0]["start"])
             if gap > 1.0 or duration >= 12.0 or len(current) >= 18:
                 text = " ".join(item["word"] for item in current).strip()
-                if text and not is_transcription_instruction_leak(text):
+                if text:
                     segments.append({
                         "start": float(current[0]["start"]),
                         "end": float(current[-1]["end"]),
@@ -1615,7 +1535,7 @@ def _segments_from_words(words: list[dict]) -> list[dict]:
         current.append(word)
     if current:
         text = " ".join(item["word"] for item in current).strip()
-        if text and not is_transcription_instruction_leak(text):
+        if text:
             segments.append({
                 "start": float(current[0]["start"]),
                 "end": float(current[-1]["end"]),
@@ -1625,12 +1545,17 @@ def _segments_from_words(words: list[dict]) -> list[dict]:
     return segments
 
 
-def segments_from_transcription_response(payload: dict) -> list[dict]:
+def segments_from_deepgram_response(payload: dict) -> list[dict]:
     if not isinstance(payload, dict):
         return []
-    raw_segments = payload.get("segments") if isinstance(payload.get("segments"), list) else []
+    results = payload.get("results") if isinstance(payload.get("results"), dict) else {}
+    raw_segments = results.get("utterances") if isinstance(results.get("utterances"), list) else []
+    alternatives = []
+    for channel in results.get("channels", []) if isinstance(results.get("channels"), list) else []:
+        if isinstance(channel, dict) and isinstance(channel.get("alternatives"), list):
+            alternatives.extend(item for item in channel["alternatives"] if isinstance(item, dict))
     top_level_words = _clean_transcription_words(
-        payload.get("words") if isinstance(payload.get("words"), list) else []
+        alternatives[0].get("words") if alternatives and isinstance(alternatives[0].get("words"), list) else []
     )
     if not raw_segments:
         return _segments_from_words(top_level_words)
@@ -1644,8 +1569,8 @@ def segments_from_transcription_response(payload: dict) -> list[dict]:
             end = max(start, float(segment.get("end", start)))
         except (TypeError, ValueError):
             continue
-        text = str(segment.get("text", "")).strip()
-        if not text or is_transcription_instruction_leak(text):
+        text = str(segment.get("transcript") or segment.get("text") or "").strip()
+        if not text:
             continue
         segment_words = _clean_transcription_words(
             segment.get("words") if isinstance(segment.get("words"), list) else []
@@ -1657,260 +1582,6 @@ def segments_from_transcription_response(payload: dict) -> list[dict]:
             clean_segment["words"] = segment_words
         segments.append(clean_segment)
     return segments
-
-
-def build_gemini_transcription_prompt() -> str:
-    script_instruction = (
-        "For Hindi, Urdu, Punjabi, or mixed Hindi-English speech, write the original spoken words in Roman Hinglish. "
-        "Keep English words as English. "
-    )
-    return (
-        "Transcribe this audio accurately and preserve the speaker's original words. "
-        "Do not translate to English, rewrite, or summarize the speech. "
-        f"{script_instruction}"
-        "Format your response as a JSON array of objects, each with: "
-        '"start" (seconds, float), "end" (seconds, float), "text" (string). '
-        "Keep each segment under 15 seconds. Output ONLY the JSON array, no explanation."
-    )
-
-class GroqRequestTooLarge(RuntimeError):
-    pass
-
-
-def audio_file_size_bytes(audio_path: str) -> int:
-    try:
-        return Path(audio_path).stat().st_size
-    except OSError:
-        return 0
-
-
-def should_chunk_groq_audio(audio_path: str, limit_bytes: int = 24 * 1024 * 1024) -> bool:
-    return audio_file_size_bytes(audio_path) > limit_bytes
-
-
-def get_audio_duration(audio_path: str) -> float:
-    try:
-        result = run_command(
-            [
-                "ffprobe",
-                "-v",
-                "error",
-                "-show_entries",
-                "format=duration",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-                audio_path,
-            ],
-            timeout=60,
-        )
-        if result.returncode != 0:
-            return 0.0
-        return max(0.0, float((result.stdout or "0").strip() or 0))
-    except Exception:
-        return 0.0
-
-
-def build_audio_chunk_path(audio_path: str, index: int) -> str:
-    path = Path(audio_path)
-    return path.with_name(f"{path.stem}_chunk_{index:03d}{path.suffix}").as_posix()
-
-
-def split_audio_for_transcription(
-    audio_path: str,
-    chunk_seconds: int = 600,
-    video_id: Optional[int] = None,
-) -> list[dict]:
-    duration = get_audio_duration(audio_path)
-    if duration <= 0:
-        return [{"path": audio_path, "offset": 0.0}]
-    chunks = []
-    offset = 0.0
-    index = 1
-    while offset < duration:
-        chunk_path = build_audio_chunk_path(audio_path, index)
-        chunk_duration = min(float(chunk_seconds), duration - offset)
-        result = run_command(
-            [
-                "ffmpeg",
-                "-y",
-                "-ss",
-                f"{offset:g}",
-                "-i",
-                audio_path,
-                "-t",
-                f"{chunk_duration:g}",
-                "-vn",
-                "-ar",
-                "16000",
-                "-ac",
-                "1",
-                "-q:a",
-                "0",
-                chunk_path,
-            ],
-            timeout=300,
-            video_id=video_id,
-        )
-        if result.returncode != 0:
-            raise RuntimeError("FFmpeg audio chunking failed.")
-        chunks.append({"path": chunk_path, "offset": float(offset)})
-        offset += float(chunk_seconds)
-        index += 1
-    return chunks
-
-
-def offset_transcription_segments(segments: list[dict], offset_seconds: float) -> list[dict]:
-    shifted = []
-    for segment in segments or []:
-        try:
-            start = float(segment.get("start", 0)) + float(offset_seconds)
-            end = float(segment.get("end", start)) + float(offset_seconds)
-        except (TypeError, ValueError):
-            continue
-        shifted.append({
-            **segment,
-            "start": start,
-            "end": end,
-            "text": str(segment.get("text", "")).strip(),
-            **({
-                "words": _clean_transcription_words(
-                    segment.get("words") if isinstance(segment.get("words"), list) else [],
-                    offset_seconds=float(offset_seconds),
-                )
-            } if isinstance(segment.get("words"), list) else {}),
-        })
-    return shifted
-
-
-def merge_transcription_chunks(chunk_results: list[list[dict]]) -> list[dict]:
-    merged = []
-    for segments in chunk_results:
-        merged.extend(segments or [])
-    return sorted(merged, key=lambda segment: float(segment.get("start", 0)))
-
-
-def transcribe_with_whisper_local(audio_path: str, video_id: Optional[int] = None) -> Optional[list[dict]]:
-    """Try the local openai-whisper CLI. Returns segments list or None."""
-    try:
-        out_dir = Path(audio_path).parent
-        command = [
-            "whisper",
-            audio_path,
-            "--task",
-            "transcribe",
-            "--output_format",
-            "json",
-            "--output_dir",
-            str(out_dir),
-        ]
-        if TRANSCRIPTION_LANGUAGE_HINT:
-            command.extend(["--language", TRANSCRIPTION_LANGUAGE_HINT])
-        result = run_command(
-            command,
-            timeout=300,
-            video_id=video_id,
-        )
-        if result.returncode != 0:
-            return None
-        json_path = out_dir / (Path(audio_path).stem + ".json")
-        if json_path.exists():
-            data = json.loads(json_path.read_text())
-            return segments_from_transcription_response(data)
-    except CancelledProcessing:
-        raise
-    except Exception:
-        pass
-    return None
-
-
-async def transcribe_with_openai_api(audio_path: str) -> Optional[list[dict]]:
-    """Transcribe via OpenAI Whisper API. Returns segments list or None."""
-    if not OPENAI_API_KEY:
-        return None
-    try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            with open(audio_path, "rb") as f:
-                response = await client.post(
-                    "https://api.openai.com/v1/audio/transcriptions",
-                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                    files={"file": (Path(audio_path).name, f, "audio/mpeg")},
-                    data=build_whisper_transcription_data("whisper-1"),
-                )
-        if response.status_code == 200:
-            return segments_from_transcription_response(response.json())
-    except Exception:
-        pass
-    return None
-
-
-async def transcribe_groq_audio_file(audio_path: str) -> list[dict]:
-    if not GROQ_API_KEY:
-        return []
-
-    async with httpx.AsyncClient(timeout=120) as client:
-        with open(audio_path, "rb") as f:
-            response = await client.post(
-                "https://api.groq.com/openai/v1/audio/transcriptions",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                files={"file": (Path(audio_path).name, f, "audio/mpeg")},
-                data={
-                    **build_whisper_transcription_data(GROQ_MODEL),
-                    "temperature": "0",
-                },
-            )
-    if response.status_code != 200:
-        try:
-            message = response.json().get("error", {}).get("message", "")
-        except Exception:
-            message = response.text
-        error_message = f"Groq API error ({response.status_code}): {message[:500]}"
-        if response.status_code == 413:
-            raise GroqRequestTooLarge(error_message)
-        raise RuntimeError(error_message)
-    return segments_from_transcription_response(response.json())
-
-
-async def transcribe_groq_audio_chunks(
-    audio_path: str,
-    chunk_seconds: int = 600,
-    video_id: Optional[int] = None,
-) -> list[dict]:
-    chunks = split_audio_for_transcription(
-        audio_path,
-        chunk_seconds=chunk_seconds,
-        video_id=video_id,
-    )
-    chunk_results = []
-    try:
-        for chunk in chunks:
-            chunk_path = str(chunk["path"])
-            offset = float(chunk.get("offset", 0))
-            segments = await transcribe_groq_audio_file(chunk_path)
-            chunk_results.append(offset_transcription_segments(segments, offset))
-    finally:
-        for chunk in chunks:
-            chunk_path = str(chunk["path"])
-            if chunk_path != audio_path:
-                Path(chunk_path).unlink(missing_ok=True)
-    return merge_transcription_chunks(chunk_results)
-
-
-async def transcribe_with_groq_api(audio_path: str, video_id: Optional[int] = None) -> Optional[list[dict]]:
-    """Transcribe via Groq's OpenAI-compatible Whisper endpoint."""
-    if not GROQ_API_KEY:
-        return None
-
-    try:
-        if should_chunk_groq_audio(audio_path):
-            return await transcribe_groq_audio_chunks(audio_path, video_id=video_id)
-        try:
-            return await transcribe_groq_audio_file(audio_path)
-        except GroqRequestTooLarge:
-            return await transcribe_groq_audio_chunks(audio_path, video_id=video_id)
-    except RuntimeError:
-        raise
-    except Exception as exc:
-        raise RuntimeError(f"Groq transcription failed: {exc}") from exc
 
 
 def _segments_to_transcript_result(
@@ -1927,7 +1598,7 @@ def _segments_to_transcript_result(
     return {
         "provider": provider,
         "model": model,
-        "language": TRANSCRIPTION_LANGUAGE_HINT,
+        "language": "",
         "confidence": 0.0,
         "segments": segments,
         "words": words,
@@ -1937,337 +1608,47 @@ def _segments_to_transcript_result(
 
 def transcribe_audio_for_clip_selection(
     audio_path: str,
-    ai_model: str,
+    ai_model: str = "",
     video_id: Optional[int] = None,
 ) -> Optional[dict]:
-    if ai_model == "groq" and GROQ_API_KEY:
-        loop = asyncio.new_event_loop()
-        try:
-            try:
-                segments = loop.run_until_complete(
-                    transcribe_with_groq_api(audio_path, video_id=video_id))
-            except RuntimeError:
-                segments = None
-        finally:
-            loop.close()
-        transcript = _segments_to_transcript_result(
-            segments, "groq", GROQ_MODEL)
-        if transcript:
-            return transcript
-
-    if ai_model == "gemini" and GEMINI_API_KEY:
-        loop = asyncio.new_event_loop()
-        try:
-            try:
-                segments = loop.run_until_complete(
-                    transcribe_with_gemini(audio_path))
-            except RuntimeError:
-                segments = None
-        finally:
-            loop.close()
-        transcript = _segments_to_transcript_result(
-            segments, "gemini", GEMINI_MODEL)
-        if transcript:
-            return transcript
-
-    if OPENAI_API_KEY:
-        loop = asyncio.new_event_loop()
-        try:
-            try:
-                segments = loop.run_until_complete(
-                    transcribe_with_openai_api(audio_path))
-            except Exception:
-                segments = None
-        finally:
-            loop.close()
-        transcript = _segments_to_transcript_result(
-            segments, "openai", "whisper-1")
-        if transcript:
-            return transcript
-
-    local_segments = transcribe_with_whisper_local(audio_path, video_id=video_id)
-    return _segments_to_transcript_result(
-        local_segments, "local-whisper", "whisper-cli")
-
-
-async def transcribe_with_gemini(audio_path: str) -> Optional[list[dict]]:
-    """
-    Transcribe audio using Google Gemini (gemini-2.0-flash).
-    Sends the audio file as inline base64 data (max ~8 MB).
-    Returns a list of pseudo-segments reconstructed from the transcript.
-    """
-    if not GEMINI_API_KEY:
-        return None
-
-    audio_bytes = Path(audio_path).read_bytes()
-    # Chunk to ≤7 MB to stay within Gemini's inline limit
-    MAX_BYTES = 7 * 1024 * 1024
-    if len(audio_bytes) > MAX_BYTES:
-        audio_bytes = audio_bytes[:MAX_BYTES]
-
-    b64_audio = base64.b64encode(audio_bytes).decode()
-
-    prompt = build_gemini_transcription_prompt()
-
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"inline_data": {"mime_type": "audio/mpeg", "data": b64_audio}},
-                    {"text": prompt},
-                ]
-            }
-        ],
-        "generationConfig": {"maxOutputTokens": 8192, "responseMimeType": "application/json"},
-    }
-
+    if not DEEPGRAM_API_KEY:
+        raise RuntimeError("DEEPGRAM_API_KEY is required for transcription.")
+    audio_file = Path(audio_path)
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            response = await client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}",
-                json=payload,
+        with audio_file.open("rb") as media, httpx.Client(timeout=180) as client:
+            response = client.post(
+                "https://api.deepgram.com/v1/listen",
+                params={
+                    "model": DEEPGRAM_MODEL,
+                    "smart_format": "true",
+                    "punctuate": "true",
+                    "utterances": "true",
+                },
+                headers={
+                    "Authorization": f"Token {DEEPGRAM_API_KEY}",
+                    "Content-Type": "audio/mpeg",
+                },
+                content=media,
             )
         if response.status_code != 200:
             try:
-                message = response.json().get("error", {}).get("message", "")
+                message = response.json().get("err_msg") or response.json().get("message") or ""
             except Exception:
                 message = response.text
-            raise RuntimeError(
-                f"Gemini API error ({response.status_code}): {message[:500]}")
-        data = response.json()
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
-        segments = json.loads(text)
-        # Normalise field names
-        result = []
-        for seg in segments:
-            result.append({
-                "start": float(seg.get("start", 0)),
-                "end": float(seg.get("end", 0)),
-                "text": str(seg.get("text", "")),
-            })
-        return result if result else None
-    except RuntimeError:
-        raise
+            raise RuntimeError(f"Deepgram transcription failed ({response.status_code}): {message[:500]}")
+        segments = segments_from_deepgram_response(response.json())
+        transcript = _segments_to_transcript_result(segments, "deepgram", DEEPGRAM_MODEL)
+        if not transcript:
+            raise RuntimeError("Deepgram returned no usable transcript segments.")
+        return transcript
     except Exception as exc:
-        raise RuntimeError(f"Gemini transcription failed: {exc}") from exc
+        if isinstance(exc, RuntimeError):
+            raise
+        raise RuntimeError(f"Deepgram transcription failed: {exc}") from exc
 
 # ---------------------------------------------------------------------------
-# Highlight scoring & clip building
+# Clip building
 # ---------------------------------------------------------------------------
-
-ENERGY_WORDS = {
-    "amazing", "incredible", "wow", "best", "worst", "never", "always",
-    "secret", "important", "shocking", "huge", "big", "win", "lose",
-    "finally", "actually", "seriously", "honestly", "literally", "crazy",
-    "unbelievable", "awesome", "terrible", "love", "hate", "must", "need",
-    "mistake", "problem", "truth", "reason", "simple", "fix", "proof",
-}
-HOOK_PHRASES = (
-    "here is", "here's", "this is why", "the problem", "the biggest",
-    "most people", "you need", "you should", "i learned", "i realized",
-    "what happened", "why", "how to", "the truth", "the mistake",
-)
-PAYOFF_WORDS = {
-    "because", "so", "therefore", "finally", "result", "fix", "solution",
-    "answer", "that means", "the point", "takeaway", "works", "worked",
-}
-
-
-def _words(text: str) -> list[str]:
-    return re.findall(r"[A-Za-z0-9']+", text.lower())
-
-
-def _clamp_score(value: float) -> int:
-    return max(0, min(100, int(round(value))))
-
-
-def _ends_cleanly(text: str) -> bool:
-    return text.strip().endswith((".", "!", "?"))
-
-
-def _starts_cleanly(text: str) -> bool:
-    first = (_words(text) or [""])[0]
-    return first not in {"and", "but", "so", "because", "then", "like"}
-
-
-def _candidate_scores(text: str, duration: float) -> tuple[int, int, str]:
-    words = _words(text)
-    first_text = " ".join(words[:18])
-    energy_hits = sum(1 for word in words if word in ENERGY_WORDS)
-    has_question = "?" in text
-    has_hook = any(
-        phrase in first_text for phrase in HOOK_PHRASES) or has_question
-    has_payoff = any(word in text.lower()
-                     for word in PAYOFF_WORDS) or _ends_cleanly(text)
-    density = len(words) / duration if duration > 0 else 0
-
-    hook_score = 22 if has_hook else 8
-    energy_score = min(18, energy_hits * 4)
-    density_score = 14 if 1.8 <= density <= 3.8 else 8 if 1.0 <= density <= 4.6 else 3
-    duration_score = 18 if 25 <= duration <= 90 else 12 if 15 <= duration <= 180 else 7
-    clean_score = 14 if _starts_cleanly(text) and _ends_cleanly(text) else 6
-    payoff_score = 14 if has_payoff else 5
-
-    virality = _clamp_score(hook_score + energy_score +
-                            density_score + duration_score + clean_score + payoff_score)
-    completion = _clamp_score(
-        (28 if _starts_cleanly(text) else 10)
-        + (30 if _ends_cleanly(text) else 10)
-        + (22 if has_payoff else 8)
-        + (20 if len(words) >= 45 else 10)
-    )
-    hook_type = "question" if has_question else "useful" if has_hook else "story"
-    return virality, completion, hook_type
-
-
-def _sentence_groups(segments: list[dict]) -> list[dict]:
-    groups = []
-    current = None
-    for seg in segments:
-        text = seg.get("text", "").strip()
-        if not text:
-            continue
-        start = float(seg.get("start", 0))
-        end = float(seg.get("end", start))
-        if current is None:
-            current = {"start": start, "end": end, "texts": [text]}
-        else:
-            gap = start - current["end"]
-            current_duration = current["end"] - current["start"]
-            if gap > 2.5 or current_duration > 14:
-                groups.append({
-                    "start": current["start"],
-                    "end": current["end"],
-                    "text": " ".join(current["texts"]).strip(),
-                })
-                current = {"start": start, "end": end, "texts": [text]}
-            else:
-                current["end"] = end
-                current["texts"].append(text)
-        if current and _ends_cleanly(text) and current["end"] - current["start"] >= 4:
-            groups.append({
-                "start": current["start"],
-                "end": current["end"],
-                "text": " ".join(current["texts"]).strip(),
-            })
-            current = None
-    if current:
-        groups.append({
-            "start": current["start"],
-            "end": current["end"],
-            "text": " ".join(current["texts"]).strip(),
-        })
-    return groups
-
-
-def build_scene_candidates(
-    segments: list[dict],
-    min_duration: float = 15,
-    preferred_max_duration: float = 90,
-    hard_max_duration: float = 300,
-    limit: int = 24,
-) -> list[dict]:
-    duration = max((float(seg.get("end", 0)) for seg in segments), default=0)
-    return shorts_director.build_director_candidates(
-        segments,
-        duration=duration,
-        preset={
-            "min_clip_duration": min_duration,
-            "preferred_max_clip_duration": preferred_max_duration,
-            "hard_max_clip_duration": hard_max_duration,
-            "allow_three_minute_shorts": hard_max_duration > 180,
-        },
-        limit=limit,
-    )
-
-
-def _overlap_ratio(a: dict, b: dict) -> float:
-    start = max(float(a["start"]), float(b["start"]))
-    end = min(float(a["end"]), float(b["end"]))
-    if end <= start:
-        return 0.0
-    overlap = end - start
-    shortest = min(float(a["end"]) - float(a["start"]),
-                   float(b["end"]) - float(b["start"]))
-    return overlap / shortest if shortest > 0 else 0.0
-
-
-def _dedupe_clips(clips: list[dict], limit: int, overlap_threshold: float = 0.5) -> list[dict]:
-    selected = []
-    for clip in clips:
-        if any(_overlap_ratio(clip, kept) >= overlap_threshold for kept in selected):
-            continue
-        selected.append(clip)
-        if len(selected) >= limit:
-            break
-    return selected
-
-
-def rank_candidates_fallback(candidates: list[dict], target_count: int = 5) -> list[dict]:
-    return shorts_director.rank_candidates_fallback(candidates, target_count=target_count)
-
-
-def _extract_json_array(text: str) -> list:
-    match = re.search(r"\[[\s\S]*\]", text or "")
-    if not match:
-        raise ValueError("No JSON array returned")
-    return json.loads(match.group(0))
-
-
-def rank_candidates_with_llm(candidates: list[dict], ai_model: str, target_count: int = 5) -> list[dict]:
-    if not candidates:
-        return []
-    prompt = shorts_director.build_director_prompt(candidates, target_count=target_count)
-    try:
-        if ai_model == "groq" and GROQ_API_KEY:
-            with httpx.Client(timeout=90) as client:
-                response = client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                    json={
-                        "model": GROQ_LLM_MODEL,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.2,
-                        "response_format": {"type": "json_object"},
-                    },
-                )
-            if response.status_code == 200:
-                content = response.json()["choices"][0]["message"]["content"]
-                data = json.loads(content)
-                llm_items = data.get("clips") if isinstance(
-                    data, dict) else data
-                return _merge_llm_rankings(candidates, llm_items, target_count)
-        if ai_model == "gemini" and GEMINI_API_KEY:
-            with httpx.Client(timeout=90) as client:
-                response = client.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}",
-                    json={
-                        "contents": [{"parts": [{"text": prompt}]}],
-                        "generationConfig": {"maxOutputTokens": 4096, "responseMimeType": "application/json"},
-                    },
-                )
-            if response.status_code == 200:
-                text = response.json()[
-                    "candidates"][0]["content"]["parts"][0]["text"]
-                try:
-                    parsed = json.loads(text)
-                    llm_items = parsed.get("clips") if isinstance(
-                        parsed, dict) else parsed
-                except Exception:
-                    llm_items = _extract_json_array(text)
-                return _merge_llm_rankings(candidates, llm_items, target_count)
-    except Exception:
-        pass
-    return rank_candidates_fallback(candidates, target_count=target_count)
-
-
-def _merge_llm_rankings(candidates: list[dict], llm_items: list, target_count: int) -> list[dict]:
-    return shorts_director.merge_llm_rankings(
-        candidates,
-        llm_items,
-        target_count=target_count,
-        preset=preset_config_for_export(),
-    )
 
 
 def request_dynamic_clip_selection(episode_map: dict, constraints: dict, ai_model: str) -> list[dict]:
@@ -2297,37 +1678,6 @@ def request_dynamic_episode_profile(seed: dict, ai_model: str) -> dict:
     )
 
 
-def build_clips_from_segments(
-    segments: list[dict],
-    target_count: int = 5,
-    min_duration: float = 20,
-    max_duration: float = 300,
-    ai_model: str = "openai",
-) -> list[dict]:
-    if not segments:
-        return []
-    source_duration = max((float(seg.get("end", 0)) for seg in segments), default=0)
-    mode = "highlights" if max_duration > 180 else "shorts"
-    clips = clip_selection.select_dynamic_clips(
-        segments,
-        source_duration,
-        ai_model=ai_model,
-        mode=mode,
-        llm_selector=request_dynamic_clip_selection,
-    )
-    return clips[:target_count] if target_count else clips
-
-
-def target_clip_count_for_duration(duration: float) -> int:
-    if duration <= 90:
-        return 1
-    if duration <= 180:
-        return 2
-    if duration <= 360:
-        return 3
-    return 6
-
-
 def complete_short_clip(segments: list[dict], duration: float) -> list[dict]:
     return clip_selection.complete_short_clip_v2(segments, duration)
 
@@ -2342,9 +1692,27 @@ def select_clips_for_video(
     video_description: str = "",
     preset: Optional[dict] = None,
 ) -> list[dict]:
+    config = preset_config_for_export(preset)
+    if config.get("clip_engine") == "comedy_v3":
+        hard_max = float(config.get("hard_max_clip_duration") or 180)
+        return comedy_v3_pipeline.select_comedy_clips(
+            segments,
+            duration,
+            audio_path=audio_path,
+            video_title=video_title,
+            video_description=video_description,
+            model_config={
+                "brain": config.get("comedy_v3_main_brain", "gemini"),
+                "gemini_api_key": GEMINI_API_KEY,
+                "gemini_model": GEMINI_MODEL,
+                "groq_api_key": GROQ_API_KEY,
+                "groq_model": GROQ_LLM_MODEL,
+            },
+            quality_mode=config.get("comedy_v3_quality_mode", "balanced"),
+            max_duration=hard_max,
+        )
     if duration <= 90:
         return complete_short_clip(segments, duration)
-    config = preset_config_for_export(preset)
     selected = clip_selection.select_dynamic_clips(
         segments,
         duration,
@@ -2359,10 +1727,6 @@ def select_clips_for_video(
         allow_fallback=False,
     )
     return selected
-
-
-def fallback_clips(duration: float, count: int = 5) -> list[dict]:
-    raise RuntimeError("Legacy clip fallback has been removed. Use the V2 timestamp engine.")
 
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
@@ -2441,7 +1805,7 @@ def _process_video_sync(
 
         # ── Step 1: Extract audio ────────────────────────────────────────────
         step(1, "running")
-        audio_ok = extract_audio(source_path, audio_path, video_id=video_id)
+        audio_ok = extract_audio(source_path, audio_path, video_id=video_id, source_duration=duration)
         if audio_ok:
             step(1, "done")
         else:
@@ -2453,11 +1817,15 @@ def _process_video_sync(
         transcript: Optional[dict] = None
         if audio_ok:
             step(2, "running", "Transcribing audio...")
-            transcript = transcribe_audio_for_clip_selection(
-                audio_path,
-                ai_model=ai_model,
-                video_id=video_id,
-            )
+            try:
+                transcript = transcribe_audio_for_clip_selection(
+                    audio_path,
+                    ai_model=ai_model,
+                    video_id=video_id,
+                )
+            except RuntimeError as exc:
+                step(2, "error", str(exc))
+                raise
             if transcript and transcript.get("segments"):
                 segments = transcript["segments"]
                 provider = transcript.get("provider") or "transcription"
@@ -2484,14 +1852,18 @@ def _process_video_sync(
         if not segments:
             step(3, "error", "Transcription failed, so clips were not generated. Retry after fixing transcription.")
             raise ValueError("Transcription failed, so clips were not generated. Retry after fixing transcription.")
-        clips = select_clips_for_video(
-            segments,
-            duration=duration,
-            ai_model=ai_model,
-            audio_path=audio_path if audio_ok else None,
-            video_title=source_title or "",
-            video_description=source_description or "",
-        )
+        try:
+            clips = select_clips_for_video(
+                segments,
+                duration=duration,
+                ai_model=ai_model,
+                audio_path=audio_path if audio_ok else None,
+                video_title=source_title or "",
+                video_description=source_description or "",
+            )
+        except RuntimeError as exc:
+            step(3, "error", str(exc))
+            raise
         if not clips:
             step(3, "error", "AI clip selection failed. No fallback clips were generated; retry after fixing the AI response.")
             raise ValueError("AI clip selection failed. No fallback clips were generated; retry after fixing the AI response.")
@@ -2505,39 +1877,12 @@ def _process_video_sync(
         step(4, "running", f"0 / {len(clips)} clips done")
         generated = 0
         export_config = preset_config_for_export()
-        def clip_timeline_key(item: tuple[int, dict]) -> tuple[float, float, int]:
-            clip_index, clip = item
-            try:
-                start_time = float(clip.get("start", 0) or 0)
-            except (TypeError, ValueError):
-                start_time = 0.0
-            try:
-                end_time = float(clip.get("end", start_time) or start_time)
-            except (TypeError, ValueError):
-                end_time = start_time
-            return (start_time, end_time, clip_index)
-
-        series_part_by_clip_index = {
-            clip_index: part_number
-            for part_number, (clip_index, _clip) in enumerate(
-                sorted(enumerate(clips), key=clip_timeline_key),
-                start=1,
-            )
-        }
         for idx, clip in enumerate(clips, start=1):
             ensure_not_cancelled(video_id)
             start, end = clip["start"], clip["end"]
             clip_dur = end - start
-            badge = series_badge.build_series_badge(
-                source_title,
-                part_number=series_part_by_clip_index.get(idx - 1, idx),
-                total_parts=len(clips),
-                label=export_config.get("series_badge_label", "Funniest Moment"),
-                enabled=export_config.get("series_badge_enabled", True),
-            )
-            clip_export_config = {**export_config, **badge}
             out_filename = f"{safe_id}_short_{idx:02d}.mp4"
-            if export_short_clip(source_path, str(OUTPUTS_DIR / out_filename), start, clip_dur, None, video_id=video_id, preset=clip_export_config):
+            if export_short_clip(source_path, str(OUTPUTS_DIR / out_filename), start, clip_dur, None, video_id=video_id, preset=export_config):
                 enriched_clip = shorts_director.enrich_clip_metadata({
                     **clip,
                     "title": clip.get("title") or f"Highlight {idx}",
@@ -2580,21 +1925,6 @@ def _process_video_sync(
                         float(enriched_clip.get("final_score", 0) or 0),
                         enriched_clip.get("score_details_json", "")[:4000],
                         enriched_clip.get("judge_status", "")[:30],
-                    ),
-                )
-                db_write(
-                    "UPDATE shorts SET series_title=?, series_part_number=?, series_total_parts=?, "
-                    "series_badge_label=?, series_badge_text=?, series_badge_enabled=? "
-                    "WHERE video_id=? AND filename=?",
-                    (
-                        badge.get("series_title", ""),
-                        int(badge.get("series_part_number") or 0),
-                        int(badge.get("series_total_parts") or 0),
-                        badge.get("series_badge_label", ""),
-                        badge.get("series_badge_text", ""),
-                        1 if badge.get("series_badge_enabled") else 0,
-                        video_id,
-                        out_filename,
                     ),
                 )
                 generated += 1
@@ -2760,6 +2090,7 @@ async def dashboard(request: Request):
             "has_youtube_key": bool(YOUTUBE_API_KEY),
             "has_openai_key": bool(OPENAI_API_KEY),
             "has_gemini_key": bool(GEMINI_API_KEY),
+            "has_deepgram_key": bool(DEEPGRAM_API_KEY),
             "has_groq_key": bool(GROQ_API_KEY),
             "default_preset": get_default_preset(),
             "presets": list_presets(),
