@@ -309,10 +309,21 @@ class ProcessingPipelineTest(unittest.TestCase):
         response = mock.Mock(status_code=429)
         response.text = '{"error":{"message":"rate limit exceeded"}}'
         response.json.return_value = {"error": {"message": "rate limit exceeded"}}
+        response.headers = {
+            "retry-after": "42",
+            "x-ratelimit-limit-requests": "10",
+            "x-ratelimit-remaining-requests": "0",
+        }
 
-        with mock.patch("services.comedy_v3.model_router.httpx.Client") as client_cls:
+        with (
+            mock.patch("services.comedy_v3.model_router.httpx.Client") as client_cls,
+            mock.patch("time.sleep") as sleep,
+        ):
             client_cls.return_value.__enter__.return_value.post.return_value = response
-            with self.assertRaisesRegex(RuntimeError, "rate-limited.*select Gemini"):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Groq Comedy V3.*HTTP 429.*llama.*rate limit exceeded.*retry-after=42.*x-ratelimit-remaining-requests=0",
+            ):
                 comedy_v3_model_router.complete_json(
                     "prompt",
                     "groq",
@@ -320,6 +331,108 @@ class ProcessingPipelineTest(unittest.TestCase):
                     groq_api_key="groq-key",
                     groq_model="llama",
                 )
+        sleep.assert_called_once_with(43.0)
+
+    def test_groq_rate_limit_retries_after_provider_wait(self):
+        limited = mock.Mock(status_code=429)
+        limited.text = '{"error":{"message":"try later"}}'
+        limited.json.return_value = {"error": {"message": "try later"}}
+        limited.headers = {"retry-after": "41"}
+
+        success = mock.Mock(status_code=200)
+        success.json.return_value = {"choices": [{"message": {"content": '{"ok": true}'}}]}
+
+        with (
+            mock.patch("services.comedy_v3.model_router.httpx.Client") as client_cls,
+            mock.patch("time.sleep") as sleep,
+        ):
+            post = client_cls.return_value.__enter__.return_value.post
+            post.side_effect = [limited, success]
+
+            result = comedy_v3_model_router.complete_json(
+                "prompt",
+                "groq",
+                30,
+                groq_api_key="groq-key",
+                groq_model="llama",
+            )
+
+        self.assertEqual({"ok": True}, result)
+        sleep.assert_called_once_with(42.0)
+        self.assertEqual(2, post.call_count)
+
+    def test_groq_rate_limit_waits_for_token_bucket_reset(self):
+        limited = mock.Mock(status_code=429)
+        limited.text = '{"error":{"message":"tokens per minute"}}'
+        limited.json.return_value = {"error": {"message": "tokens per minute"}}
+        limited.headers = {
+            "retry-after": "3",
+            "x-ratelimit-reset-tokens": "23.65s",
+        }
+
+        success = mock.Mock(status_code=200)
+        success.json.return_value = {"choices": [{"message": {"content": '{"ok": true}'}}]}
+
+        with (
+            mock.patch("services.comedy_v3.model_router.httpx.Client") as client_cls,
+            mock.patch("time.sleep") as sleep,
+        ):
+            post = client_cls.return_value.__enter__.return_value.post
+            post.side_effect = [limited, success]
+
+            result = comedy_v3_model_router.complete_json(
+                "prompt",
+                "groq",
+                30,
+                groq_api_key="groq-key",
+                groq_model="llama",
+            )
+
+        self.assertEqual({"ok": True}, result)
+        sleep.assert_called_once_with(24.65)
+        self.assertEqual(2, post.call_count)
+
+    def test_groq_request_caps_output_tokens_for_on_demand_tier(self):
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {"choices": [{"message": {"content": '{"ok": true}'}}]}
+
+        with mock.patch("services.comedy_v3.model_router.httpx.Client") as client_cls:
+            post = client_cls.return_value.__enter__.return_value.post
+            post.return_value = response
+
+            comedy_v3_model_router.complete_json(
+                "prompt",
+                "groq",
+                30,
+                groq_api_key="groq-key",
+                groq_model="llama",
+            )
+
+        payload = post.call_args.kwargs["json"]
+        self.assertLessEqual(payload["max_tokens"], 1024)
+
+    def test_comedy_v3_prompt_samples_are_bounded(self):
+        segments = [{"start": idx, "end": idx + 1, "text": f"segment {idx}"} for idx in range(100)]
+
+        samples = comedy_v3_pipeline._samples(segments)
+
+        self.assertLessEqual(len(samples), 24)
+
+    def test_comedy_v3_prompt_items_are_compacted(self):
+        items = [
+            {
+                "candidate_id": f"c_{idx}",
+                "summary": "x" * 500,
+                "people_involved": ["a", "b", "c", "d", "e", "f", "g"],
+            }
+            for idx in range(40)
+        ]
+
+        compact = comedy_v3_pipeline._compact_prompt_items(items, limit=12)
+
+        self.assertEqual(12, len(compact))
+        self.assertEqual(220, len(compact[0]["summary"]))
+        self.assertEqual(["a", "b", "c", "d", "e", "f"], compact[0]["people_involved"])
 
     def test_balanced_selector_keeps_a_tier_and_strong_b_tier_only(self):
         clips = comedy_v3_selector.select_final_clips([

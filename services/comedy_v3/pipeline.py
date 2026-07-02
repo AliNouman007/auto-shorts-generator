@@ -14,6 +14,12 @@ from .scoring import score_clip, score_to_percent
 from .selector import select_final_clips
 from .worthiness_judge import fallback_judgements
 
+PROMPT_SAMPLE_LIMIT = 24
+PROMPT_AUDIO_PEAK_LIMIT = 24
+PROMPT_SCENE_LIMIT = 20
+PROMPT_CANDIDATE_LIMIT = 24
+PROMPT_TEXT_LIMIT = 220
+
 
 def _require_selected_key(model_config: dict) -> None:
     brain = normalize_brain(model_config.get("brain"))
@@ -35,11 +41,28 @@ def _model_json(prompt: str, model_config: dict, timeout: int = 90) -> dict:
     )
 
 
-def _samples(segments: list[dict], limit: int = 48) -> list[dict]:
+def _samples(segments: list[dict], limit: int = PROMPT_SAMPLE_LIMIT) -> list[dict]:
     if len(segments) <= limit:
         return segments
     step = max(1, len(segments) // limit)
     return segments[::step][:limit]
+
+
+def _compact_prompt_items(items: list[dict], limit: int) -> list[dict]:
+    compact_items = []
+    for item in items[:limit]:
+        if not isinstance(item, dict):
+            continue
+        compact = {}
+        for key, value in item.items():
+            if isinstance(value, str):
+                compact[key] = value[:PROMPT_TEXT_LIMIT]
+            elif isinstance(value, list):
+                compact[key] = value[:6]
+            else:
+                compact[key] = value
+        compact_items.append(compact)
+    return compact_items
 
 
 def _list_from(data: dict, key: str) -> list[dict]:
@@ -126,7 +149,7 @@ def select_comedy_clips(
         return []
 
     peaks = analyze_audio_peaks(audio_path)
-    audio_peak_summary = peaks[:40]
+    audio_peak_summary = peaks[:PROMPT_AUDIO_PEAK_LIMIT]
     seed = {
         "title": video_title,
         "description": video_description,
@@ -142,11 +165,14 @@ def select_comedy_clips(
         episode_analysis = _model_json(prompts.episode_analyst_prompt(seed), model_config, timeout=60) or episode_analysis
         scene_data = _model_json(prompts.scene_builder_prompt({**seed, "episode_analysis": episode_analysis}), model_config, timeout=90)
         scenes = _list_from(scene_data, "scenes") or scenes
-        moment_data = _model_json(prompts.moment_finder_prompt({**seed, "episode_analysis": episode_analysis, "scenes": scenes}), model_config, timeout=90)
+        prompt_scenes = _compact_prompt_items(scenes, PROMPT_SCENE_LIMIT)
+        moment_data = _model_json(prompts.moment_finder_prompt({**seed, "episode_analysis": episode_analysis, "scenes": prompt_scenes}), model_config, timeout=90)
         moments = _list_from(moment_data, "moments") or moments
-        boundary_data = _model_json(prompts.boundary_expander_prompt({**seed, "scenes": scenes, "moments": moments, "max_duration": max_duration}), model_config, timeout=90)
+        moments = _compact_prompt_items(moments, PROMPT_CANDIDATE_LIMIT)
+        boundary_data = _model_json(prompts.boundary_expander_prompt({**seed, "scenes": prompt_scenes, "moments": moments, "max_duration": max_duration}), model_config, timeout=90)
         raw_boundaries = _list_from(boundary_data, "boundaries")
-        judgement_data = _model_json(prompts.worthiness_judge_prompt({**seed, "scenes": scenes, "moments": moments, "boundaries": raw_boundaries}), model_config, timeout=90)
+        raw_boundaries = _compact_prompt_items(raw_boundaries, PROMPT_CANDIDATE_LIMIT)
+        judgement_data = _model_json(prompts.worthiness_judge_prompt({**seed, "scenes": prompt_scenes, "moments": moments, "boundaries": raw_boundaries}), model_config, timeout=90)
         judgements = _list_from(judgement_data, "judgements")
     except RuntimeError:
         raise
